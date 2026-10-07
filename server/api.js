@@ -3,6 +3,7 @@ const store = require('./store');
 const { AppError } = require('./errors');
 const res = require('./resources');
 const monitor = require('./monitor');
+const permit = require('./permit');
 
 const router = express.Router();
 
@@ -28,11 +29,14 @@ function currentMonth(data) {
 function overview(data) {
   const settings = data.settings;
   const month = currentMonth(data);
+  const refDay = month + '-01';
   const outletRows = data.outlets.map((o) => monitor.outletSummary(data, o.id, month));
   const statusCount = {};
   for (const p of data.plants) statusCount[p.status] = (statusCount[p.status] || 0) + 1;
   const deviceStatus = {};
   for (const d of data.devices) deviceStatus[d.status] = (deviceStatus[d.status] || 0) + 1;
+  const balCod = monitor.permitBalance(data, 'COD', refDay);
+  const balAmmonia = monitor.permitBalance(data, '氨氮', refDay);
   return {
     today: store.nowText().slice(0, 10),
     month,
@@ -49,10 +53,15 @@ function overview(data) {
     reportCount: data.reports.length,
     submittedReportCount: data.reports.filter((r) => r.status === '已上报').length,
     exceededOutletCount: outletRows.filter((s) => s.rows.some((r) => r.exceeded)).length,
-    accumulatedCodTons: monitor.accumulatedTons(data, 'COD'),
-    accumulatedAmmoniaTons: monitor.accumulatedTons(data, '氨氮'),
-    permitCodTons: Number(settings.annualPermitCodTons),
-    permitAmmoniaTons: Number(settings.annualPermitAmmoniaTons),
+    accumulatedCodTons: monitor.accumulatedTons(data, 'COD', refDay),
+    accumulatedAmmoniaTons: monitor.accumulatedTons(data, '氨氮', refDay),
+    permitCodTons: permit.permitAt(data, 'COD', refDay).tons,
+    permitAmmoniaTons: permit.permitAt(data, '氨氮', refDay).tons,
+    remainingCodTons: balCod.remainingTons,
+    remainingAmmoniaTons: balAmmonia.remainingTons,
+    carriedCodTons: balCod.carriedTons,
+    carriedAmmoniaTons: balAmmonia.carriedTons,
+    permitChangeCount: (data.permitChanges || []).length,
     settings: {
       oxygenBaseline: Number(settings.oxygenBaseline),
       rangeMax: Number(settings.rangeMax),
@@ -128,6 +137,24 @@ router.get('/reports', withData((data, req) => res.listReports(data, req.query))
 router.post('/reports', withData((data, req) => ({ __save: true, __body: res.createReport(data, req.body || {}) })));
 router.get('/reports/:id', withData((data, req) => res.reportDetail(data, req.params.id)));
 router.patch('/reports/:id', withData((data, req) => ({ __save: true, __body: res.updateReport(data, req.params.id, req.body || {}) })));
+
+// 许可变更登记与分段核算
+router.get('/permit/changes', withData((data, req) => permit.listChanges(data, req.query)));
+router.post('/permit/changes', withData((data, req) => ({ __save: true, __body: permit.createChange(data, req.body || {}) })));
+router.delete('/permit/changes/:id', withData((data, req) => ({ __save: true, __body: permit.removeChange(data, req.params.id) })));
+router.get('/permit/segments', withData((data, req) => {
+  const metric = req.query.metric || 'COD';
+  if (!permit.PERMIT_METRICS.includes(metric)) throw new AppError(400, 'VALIDATION_FAILED', '指标只能是：' + permit.PERMIT_METRICS.join('、'), { metric: '指标取值不对' });
+  const ref = String(req.query.refDay || store.nowText().slice(0, 10)).slice(0, 10);
+  const result = permit.segmentsForYear(data, metric, ref);
+  return { metric, year: result.year, segments: result.segments, carryOver: permit.carryOverForYear(data, metric, result.year.start) };
+}));
+router.get('/permit/balance', withData((data, req) => {
+  const ref = String(req.query.refDay || store.nowText().slice(0, 10)).slice(0, 10);
+  const out = {};
+  for (const metric of permit.PERMIT_METRICS) out[metric] = monitor.permitBalance(data, metric, ref);
+  return out;
+}));
 
 router.use((req, r, next) => next(new AppError(404, 'NOT_FOUND', '这个地址没有对应功能：' + req.method + ' ' + req.originalUrl)));
 

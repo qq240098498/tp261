@@ -329,8 +329,36 @@ function reportDetail(data, id) {
   if (!report) throw new AppError(404, 'REPORT_NOT_FOUND', '这张报表不存在');
   const plant = monitor.plantOf(data, report.plantId);
   const month = String(report.period).slice(0, 7);
+  // 已上报：结论冻结在上报时刻的快照里，之后的许可变更不改写它
+  if (report.status === '已上报' && report.snapshot) {
+    return Object.assign({}, report, {
+      plant,
+      month,
+      frozen: true,
+      permitMetrics: report.snapshot.metrics,
+      outlets: report.snapshot.outlets,
+    });
+  }
   const outlets = monitor.outletsOf(data, report.plantId).map((o) => monitor.outletSummary(data, o.id, month));
-  return Object.assign({}, report, { plant, month, outlets });
+  const permitMetrics = {};
+  for (const metric of ['COD', '氨氮']) permitMetrics[metric] = monitor.permitBlock(data, metric, month);
+  return Object.assign({}, report, { plant, month, frozen: false, permitMetrics, outlets });
+}
+
+// 上报时刻的核算结论快照：各排放口汇总 + 当时生效的许可版本、分段与结转
+function buildReportSnapshot(data, report) {
+  const month = String(report.period).slice(0, 7);
+  const metrics = {};
+  for (const metric of ['COD', '氨氮']) {
+    const bal = monitor.permitBalance(data, metric, month + '-01');
+    metrics[metric] = Object.assign({}, monitor.permitBlock(data, metric, month), { yearSegments: bal.segments });
+  }
+  return {
+    frozenAt: store.nowText(),
+    month,
+    metrics,
+    outlets: monitor.outletsOf(data, report.plantId).map((o) => monitor.outletSummary(data, o.id, month)),
+  };
 }
 
 function createReport(data, payload) {
@@ -347,6 +375,7 @@ function createReport(data, payload) {
     submittedBy: String(payload.submittedBy || ''),
     remark: String(payload.remark || ''),
   };
+  if (report.status === '已上报') report.snapshot = buildReportSnapshot(data, report);
   data.reports.push(report);
   return report;
 }
@@ -356,6 +385,10 @@ function updateReport(data, id, payload) {
   if (!report) throw new AppError(404, 'REPORT_NOT_FOUND', '这张报表不存在');
   if (payload.status && !REPORT_STATUS.includes(payload.status)) {
     throw new AppError(400, 'VALIDATION_FAILED', '状态只能是：' + REPORT_STATUS.join('、'), { status: '状态取值不对' });
+  }
+  // 进入「已上报」时冻结快照；退回后再上报会按当时口径重新冻结
+  if (payload.status === '已上报' && report.status !== '已上报') {
+    report.snapshot = buildReportSnapshot(data, report);
   }
   if (payload.status) report.status = payload.status;
   if (payload.submittedAt !== undefined) report.submittedAt = String(payload.submittedAt);

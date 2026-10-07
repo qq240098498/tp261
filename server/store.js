@@ -22,7 +22,7 @@ const DEFAULT_SETTINGS = {
 function normalize(raw) {
   const data = raw && typeof raw === 'object' ? raw : {};
   data.settings = Object.assign({}, DEFAULT_SETTINGS, data.settings || {});
-  for (const key of ['plants', 'outlets', 'devices', 'readings', 'reports']) {
+  for (const key of ['plants', 'outlets', 'devices', 'readings', 'reports', 'permitChanges']) {
     if (!Array.isArray(data[key])) data[key] = [];
   }
   return data;
@@ -97,7 +97,42 @@ function nowText() {
   return now.getUTCFullYear() + '-' + p(now.getUTCMonth() + 1) + '-' + p(now.getUTCDate()) + ' ' + p(now.getUTCHours()) + ':' + p(now.getUTCMinutes()) + ':' + p(now.getUTCSeconds());
 }
 
+// 日期工具：统一按 UTC 处理 YYYY-MM-DD，避免时区误差
+function parseDay(day) {
+  const [y, m, d] = String(day).slice(0, 10).split('-').map(Number);
+  return Date.UTC(y, m - 1, d);
+}
+
+function formatDay(ms) {
+  const t = new Date(ms);
+  const p = (n) => String(n).padStart(2, '0');
+  return t.getUTCFullYear() + '-' + p(t.getUTCMonth() + 1) + '-' + p(t.getUTCDate());
+}
+
+function addDays(day, n) {
+  return formatDay(parseDay(day) + n * 86400000);
+}
+
+// 两个日期之间的天数（end 不含）
+function daysBetween(startDay, endDay) {
+  return Math.round((parseDay(endDay) - parseDay(startDay)) / 86400000);
+}
+
+// 许可年：以 anchor（YYYY-MM-DD，只用月日）为每年的起始，返回包含 day 的许可年
+function permitYearOf(day, anchor) {
+  const anchorMD = String(anchor || '2026-01-01').slice(5);
+  let year = Number(String(day).slice(0, 4));
+  let start = year + '-' + anchorMD;
+  if (parseDay(day) < parseDay(start)) {
+    year -= 1;
+    start = year + '-' + anchorMD;
+  }
+  const end = (year + 1) + '-' + anchorMD;
+  return { start, end, days: daysBetween(start, end), label: year + ' 许可年（' + start + ' 至 ' + addDays(end, -1) + '）' };
+}
+
 module.exports = {
   load, save, nextId, normalize, round, daysInMonth, daysInQuarter, monthOf, dayOf, quarterOf, nowText,
+  parseDay, formatDay, addDays, daysBetween, permitYearOf,
   DEFAULT_SETTINGS, dataFile,
 };

@@ -30,7 +30,8 @@
     outletsFilter: { plantId: '', status: '' },
     devicesFilter: { outletId: '', metric: '', status: '' },
     readingsFilter: { outletId: '', deviceId: '', metric: '', day: '', month: '' },
-    accounting: { outletId: '', month: '', metric: 'COD' }
+    accounting: { outletId: '', month: '', metric: 'COD' },
+    permit: { metric: 'COD', refDay: '' }
   };
 
   /* ================= 基础工具 ================= */
@@ -347,6 +348,7 @@
     else if (view === 'devices') renderDevices();
     else if (view === 'readings') renderReadings();
     else if (view === 'accounting') renderAccounting();
+    else if (view === 'permit') renderPermit();
   }
 
   /* ================= 概览 ================= */
@@ -382,8 +384,9 @@
       metricCard('监测数据', s.readingCount, '自动 ' + s.autoCount + ' · 补录 ' + s.imputedCount + ' · 无效标记 ' + s.invalidFlagCount, 'readings'),
       metricCard('报表', s.reportCount, '已上报 ' + s.submittedReportCount + ' 张', 'accounting'),
       metricCard('超标排放口', s.exceededOutletCount, '存在月超标判定', 'accounting'),
-      metricCard('年累计 COD', s.accumulatedCodTons + ' 吨', '年许可量 ' + s.permitCodTons + ' 吨', 'accounting'),
-      metricCard('年累计氨氮', s.accumulatedAmmoniaTons + ' 吨', '年许可量 ' + s.permitAmmoniaTons + ' 吨', 'accounting')
+      metricCard('年累计 COD', s.accumulatedCodTons + ' 吨', '年许可量 ' + s.permitCodTons + ' 吨 · 剩余 ' + s.remainingCodTons + ' 吨', 'accounting'),
+      metricCard('年累计氨氮', s.accumulatedAmmoniaTons + ' 吨', '年许可量 ' + s.permitAmmoniaTons + ' 吨 · 剩余 ' + s.remainingAmmoniaTons + ' 吨', 'accounting'),
+      metricCard('许可变更', (s.permitChangeCount || 0) + ' 条', '分段核算与结转', 'permit')
     ]));
 
     var tb = h('tbody');
@@ -892,6 +895,7 @@
   function summaryCard(sum, metric) {
     var row = metricOf(sum.rows, metric);
     var st = sum.settings || {};
+    var pi = (sum.permitInfo || {})[metric] || {};
     var cells = [
       ['月均', fmt(row.monthAverage)],
       ['月总量(吨)', fmt(row.monthTotalTons, 4)],
@@ -904,7 +908,12 @@
       ['限值', textOf(row.limit)],
       ['超标判定', row.exceeded ? '超标' : '达标'],
       ['年累计氨氮(吨)', fmt(sum.accumulatedAmmoniaTons, 4)],
-      ['年许可量氨氮(吨)', fmt(st.annualPermitAmmoniaTons, 4)]
+      ['年许可量氨氮(吨)', fmt(st.annualPermitAmmoniaTons, 4)],
+      ['许可版本', textOf(pi.currentVersion)],
+      ['月许可量(吨)', fmt(pi.monthPermitTons, 4)],
+      ['折合年许可(吨)', fmt(pi.yearEquivalentTons, 4)],
+      ['结转带入(吨)', fmt(pi.carriedTons, 4)],
+      ['剩余许可量(吨)', fmt(pi.remainingTons, 4)]
     ];
     var grid = h('div', { class: 'summary-grid' });
     cells.forEach(function (p) {
@@ -969,6 +978,23 @@
       h('b', { text: '单位：' }), rep.plant ? ((rep.plant.code || '') + ' ' + (rep.plant.name || '')) : '—',
       '　', h('b', { text: '期间：' }), rep.period, '　', h('b', { text: '月份：' }), rep.month
     ]));
+    if (rep.frozen) {
+      box.appendChild(h('div', { class: 'section-note' }, [
+        h('b', { text: '已上报，结论已冻结：' }),
+        '以下汇总与许可口径取自上报时刻（' + ((rep.snapshot && rep.snapshot.frozenAt) || '') + '）的快照，之后的许可变更不改写本表。'
+      ]));
+    }
+    MAIN_METRICS.forEach(function (m) {
+      var pm = (rep.permitMetrics || {})[m];
+      if (!pm) return;
+      var vers = (pm.versions || []).map(function (v) {
+        return v.version + '（' + v.from + ' 起 ' + v.annualTons + ' 吨/年，依据 ' + v.basisDoc + '）';
+      }).join('；');
+      box.appendChild(h('div', { class: 'section-note' }, [
+        h('b', { text: m + ' 许可口径' + (rep.frozen ? '（冻结值）' : '（当前值）') + '：' }),
+        '版本 ' + (vers || '—') + '　月许可量 ' + fmt(pm.monthPermitTons, 4) + ' 吨　折合年许可 ' + fmt(pm.yearEquivalentTons, 4) + ' 吨　结转带入 ' + fmt(pm.carriedTons, 4) + ' 吨　许可年已用 ' + fmt(pm.usedTons, 4) + ' 吨　剩余 ' + fmt(pm.remainingTons, 4) + ' 吨'
+      ]));
+    });
     var outs = rep.outlets || [];
     if (!outs.length) box.appendChild(h('div', { class: 'empty', text: '该单位本月没有排放口数据' }));
     outs.forEach(function (os) {
@@ -1126,12 +1152,26 @@
       sum = out[0]; daily = out[1];
     } catch (e) { showError(e); c.appendChild(h('div', { class: 'empty', text: '加载失败：' + e.message })); return; }
 
+    var sumBody = h('div', { class: 'card-body' }, summaryCard(sum, metric));
+    var piForNotes = (sum.permitInfo || {})[metric] || {};
+    if (piForNotes.versions && piForNotes.versions.length) {
+      var verText = piForNotes.versions.map(function (v) {
+        return v.version + '（' + v.from + ' 起 ' + v.annualTons + ' 吨/年，依据 ' + v.basisDoc + '）';
+      }).join('；');
+      sumBody.appendChild(h('div', { class: 'section-note', text: month + ' 核算使用的许可版本：' + verText }));
+    }
+    if (sum.frozenReport) {
+      sumBody.appendChild(h('div', { class: 'section-note' }, [
+        h('b', { text: '该月已有已上报报表 ' + sum.frozenReport.id + '（冻结于 ' + (sum.frozenReport.frozenAt || '上报时刻') + '）：' }),
+        '报表结论以快照为准，之后的许可变更不改写它；此处显示的是按当前许可版本重算的口径。'
+      ]));
+    }
     c.appendChild(h('div', { class: 'card' }, [
       h('div', { class: 'card-head' }, [
         h('h2', { text: (sum.outlet ? (sum.outlet.code + ' ' + sum.outlet.name) : '排放口') + ' 汇总' }),
         h('span', { class: 'sub', text: (sum.plant ? (sum.plant.code + ' ' + sum.plant.name) : '') + ' · ' + month + ' · ' + metric })
       ]),
-      h('div', { class: 'card-body' }, summaryCard(sum, metric))
+      sumBody
     ]));
 
     var series = (daily.metrics || {})[metric] || [];
@@ -1171,6 +1211,160 @@
     ]));
   }
 
+  /* ================= 许可变更与结转 ================= */
+  function openPermitChangeForm() {
+    var fields = [
+      { name: 'metric', label: '指标', type: 'select', options: MAIN_METRICS },
+      { name: 'effectiveAt', label: '变更生效日', type: 'date' },
+      { name: 'afterTons', label: '变更后年许可量（吨）', type: 'number' },
+      { name: 'basisDoc', label: '依据文件' },
+      { name: 'registeredBy', label: '登记人' },
+      { name: 'carryOverEnabled', label: '余额是否带入下一许可年', type: 'select', options: ['否', '是'] },
+      { name: 'carryOverTons', label: '结转量（吨，选「是」时必填）', type: 'number' }
+    ];
+    var form = buildForm(fields, { metric: state.permit.metric, effectiveAt: state.today, carryOverEnabled: '否' });
+    form.appendChild(h('div', { class: 'hint', text: '变更前数值由系统按生效日前一天生效的许可自动记录；生效日落在新的许可年的变更属于跨年变更，请明确余额能否带入与带多少。' }));
+    var save = h('button', { type: 'button', class: 'btn btn-accent', text: '登记变更' });
+    save.addEventListener('click', function () {
+      var raw = collectForm(form);
+      var payload = {
+        metric: raw.metric,
+        effectiveAt: raw.effectiveAt,
+        afterTons: raw.afterTons === '' ? undefined : Number(raw.afterTons),
+        basisDoc: raw.basisDoc,
+        registeredBy: raw.registeredBy,
+        carryOverEnabled: raw.carryOverEnabled === '是'
+      };
+      if (payload.carryOverEnabled) payload.carryOverTons = raw.carryOverTons === '' ? undefined : Number(raw.carryOverTons);
+      api('POST', '/api/permit/changes', payload).then(function () { closeModal(); return afterMutation('变更已登记'); }).catch(showError);
+    });
+    openModal('登记许可变更', form, [
+      h('button', { type: 'button', class: 'btn btn-ghost', text: '取消', onclick: closeModal }), save
+    ]);
+  }
+
+  function permitChangeRow(c) {
+    var actions = actionsCell([
+      deleteBtn('删除', function () {
+        return api('DELETE', '/api/permit/changes/' + c.id).then(function () { return afterMutation('已删除变更登记 ' + c.id); });
+      })
+    ]);
+    return h('tr', { class: 'row' }, [
+      h('td', {}, h('b', { text: c.version })),
+      h('td', { text: c.metric }),
+      h('td', { class: 'nowrap', text: c.effectiveAt }),
+      h('td', { class: 'mono', text: fmt(c.beforeTons, 4) }),
+      h('td', { class: 'mono', text: fmt(c.afterTons, 4) }),
+      h('td', {}, h('span', { class: 'tag ' + (c.crossYear ? 'tag-warn' : 'tag-ok'), text: c.crossYear ? '跨年' : '年内' })),
+      h('td', { class: 'mono', text: c.carryOverEnabled ? fmt(c.carryOverTons, 4) : '不带入' }),
+      h('td', { text: textOf(c.basisDoc) }),
+      h('td', { text: textOf(c.registeredBy) }),
+      h('td', { class: 'nowrap', text: textOf(c.registeredAt) }),
+      actions
+    ]);
+  }
+
+  async function renderPermit() {
+    var f = clear(document.getElementById('filters-permit'));
+    var refInput = h('input', { type: 'date' });
+    refInput.value = state.permit.refDay;
+    refInput.addEventListener('change', function () { state.permit.refDay = refInput.value; renderPermit(); });
+    f.appendChild(h('div', { class: 'filter-box' }, [
+      h('div', { class: 'filter-title', text: '许可核算口径' }),
+      h('div', { class: 'field' }, [h('label', { text: '指标' }),
+        sel(MAIN_METRICS.map(function (m) { return { value: m, label: m }; }), state.permit.metric,
+          function (v) { state.permit.metric = v; renderPermit(); })]),
+      h('div', { class: 'field' }, [h('label', { text: '参考日期（定许可年）' }), refInput,
+        h('div', { class: 'hint', text: '留空按今天' })]),
+      h('div', { class: 'field' }, [h('button', { type: 'button', class: 'btn btn-sm btn-accent', text: '登记许可变更', onclick: openPermitChangeForm })])
+    ]));
+    f.appendChild(h('div', { class: 'filter-box' }, [
+      h('div', { class: 'filter-title', text: '口径说明' }),
+      h('p', { class: 'hint', text: '许可量按变更登记分段：每个时段用当时的年许可量，按天折算（段年许可量 × 段内天数 ÷ 许可年天数）。年度内变更，已用量与剩余量按同一口径（逐小时累加）衔接；跨年变更以登记时声明的结转量为准。已上报报表的结论冻结在上报时刻，不被后续变更改写。' })
+    ]));
+
+    var c = clear(document.getElementById('content-permit'));
+    var changes, balance;
+    try {
+      var out = await Promise.all([
+        api('GET', '/api/permit/changes'),
+        api('GET', '/api/permit/balance' + qs({ refDay: state.permit.refDay }))
+      ]);
+      changes = out[0];
+      balance = out[1];
+    } catch (e) { showError(e); c.appendChild(h('div', { class: 'empty', text: '加载失败：' + e.message })); return; }
+    var bal = balance[state.permit.metric];
+
+    var carryText = (bal.carryOverItems || []).map(function (it) {
+      return it.changeId + '：' + fmt(it.tons, 4) + ' 吨（' + it.basisDoc + '，' + it.registeredBy + '，' + it.effectiveAt + ' 生效）';
+    }).join('；');
+    var balGrid = h('div', { class: 'summary-grid' });
+    [
+      ['许可年', bal.yearLabel],
+      ['折合年许可（吨）', fmt(bal.equivalentAnnualTons, 4)],
+      ['上年结转带入（吨）', fmt(bal.carriedTons, 4)],
+      ['许可年已用（吨）', fmt(bal.usedTons, 4)],
+      ['剩余许可量（吨）', fmt(bal.remainingTons, 4)],
+      ['上一许可年结存（吨）', fmt(bal.prevYear.remainingTons, 4)]
+    ].forEach(function (p) {
+      balGrid.appendChild(h('div', { class: 'summary-cell' }, [
+        h('div', { class: 'k', text: p[0] }),
+        h('div', { class: 'v', text: p[1] })
+      ]));
+    });
+    var segTb = h('tbody');
+    (bal.segments || []).forEach(function (s) {
+      segTb.appendChild(h('tr', { class: 'row' }, [
+        h('td', {}, h('b', { text: s.version })),
+        h('td', { class: 'nowrap', text: s.from + ' 至 ' + s.to }),
+        h('td', { class: 'mono', text: textOf(s.days) }),
+        h('td', { class: 'mono', text: fmt(s.annualTons, 4) }),
+        h('td', { class: 'mono', text: fmt(s.equivalentTons, 4) }),
+        h('td', { class: 'mono', text: fmt(s.usedTons, 4) }),
+        h('td', { text: textOf(s.basisDoc) }),
+        h('td', { text: textOf(s.registeredBy) })
+      ]));
+    });
+    c.appendChild(h('div', { class: 'card' }, [
+      h('div', { class: 'card-head' }, [
+        h('h2', { text: state.permit.metric + ' 剩余许可量结转' }),
+        h('span', { class: 'sub', text: '剩余 = 折合年许可 + 上年结转 − 许可年已用（同一口径逐小时累加）' })
+      ]),
+      h('div', { class: 'card-body' }, [
+        balGrid,
+        h('div', { class: 'section-note', text: carryText ? ('结转明细：' + carryText) : '本许可年没有登记结转带入；跨年变更时在变更登记里声明「余额是否带入下一许可年、带多少」。' }),
+        h('div', { class: 'section-note', text: '分段核算：每个时段用当时的年许可量，段内已用按同一口径累加。' }),
+        h('div', { class: 'table-wrap' }, h('table', {}, [
+          h('thead', {}, h('tr', {}, [
+            h('th', { text: '版本' }), h('th', { text: '时段' }), h('th', { text: '天数' }), h('th', { text: '年许可量(吨)' }),
+            h('th', { text: '折合许可(吨)' }), h('th', { text: '段内已用(吨)' }), h('th', { text: '依据文件' }), h('th', { text: '登记人' })
+          ])),
+          segTb
+        ]))
+      ])
+    ]));
+
+    var changeTb = h('tbody');
+    changes.forEach(function (ch) { changeTb.appendChild(permitChangeRow(ch)); });
+    c.appendChild(h('div', { class: 'card' }, [
+      h('div', { class: 'card-head' }, [
+        h('h2', { text: '变更登记记录' }),
+        h('div', { class: 'btn-row' }, [
+          h('span', { class: 'sub', text: '共 ' + changes.length + ' 条（被已上报报表引用的不能删除）' }),
+          h('button', { type: 'button', class: 'btn btn-sm btn-accent', text: '登记许可变更', onclick: openPermitChangeForm })
+        ])
+      ]),
+      h('div', { class: 'table-wrap' }, h('table', { id: 'tablePermitChanges' }, [
+        h('thead', {}, h('tr', {}, [
+          h('th', { text: '版本' }), h('th', { text: '指标' }), h('th', { text: '生效日' }), h('th', { text: '变更前(吨/年)' }),
+          h('th', { text: '变更后(吨/年)' }), h('th', { text: '跨年' }), h('th', { text: '结转带入(吨)' }),
+          h('th', { text: '依据文件' }), h('th', { text: '登记人' }), h('th', { text: '登记时刻' }), h('th', { text: '操作' })
+        ])),
+        changeTb
+      ]))
+    ]));
+  }
+
   /* ================= 设置 ================= */
   function openSettings() {
     var s = state.settings || {};
@@ -1181,10 +1375,11 @@
       { name: 'codDailyLimit', label: 'COD 日限值', type: 'number' },
       { name: 'ammoniaDailyLimit', label: '氨氮日限值', type: 'number' },
       { name: 'hourlyExceedCountLimit', label: '小时超标次数', type: 'number' },
-      { name: 'annualPermitCodTons', label: '年许可 COD（吨）', type: 'number' },
-      { name: 'annualPermitAmmoniaTons', label: '年许可氨氮（吨）', type: 'number' }
+      { name: 'annualPermitCodTons', label: '初始年许可 COD（吨，V1 基准）', type: 'number' },
+      { name: 'annualPermitAmmoniaTons', label: '初始年许可氨氮（吨，V1 基准）', type: 'number' }
     ];
     var form = buildForm(fields, s);
+    form.appendChild(h('div', { class: 'hint', text: '许可量中途调整请到「许可变更」页登记（变更时刻、前后数值、依据文件、登记人都会留痕）；这里改的是初始基准值，直接改不会留下变更记录。' }));
     var save = h('button', { type: 'button', class: 'btn btn-accent', text: '保存设置' });
     save.addEventListener('click', function () {
       var raw = collectForm(form);

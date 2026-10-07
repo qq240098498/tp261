@@ -1,5 +1,6 @@
 // 监测数据口径都集中在这里：有效读数、折算、日均、总量、超标、许可
 const store = require('./store');
+const permit = require('./permit');
 
 function plantOf(data, id) {
   return data.plants.find((p) => p.id === id) || null;
@@ -120,17 +121,37 @@ function monthAverage(data, outletId, metric, month) {
   return store.round(sum / days, 2);
 }
 
+// 月份范围：[月初, 次月初)
+function monthRange(month) {
+  const [y, m] = String(month).split('-').map(Number);
+  const start = y + '-' + String(m).padStart(2, '0') + '-01';
+  const end = m === 12 ? (y + 1) + '-01-01' : y + '-' + String(m + 1).padStart(2, '0') + '-01';
+  return [start, end];
+}
+
+// 时段总量（吨）：逐小时按时刻配对（浓度与流量取同一时刻的那一对）累加，月/季/年/分段都用这一套口径
+function totalInRange(data, outletId, metric, startDay, endDay) {
+  const settings = data.settings;
+  const rows = readingsOf(data, { outletId, metric }).filter((r) => {
+    const day = store.dayOf(r.at);
+    return day >= startDay && day < endDay && isCounted(r, deviceOf(data, r.deviceId), settings);
+  });
+  let mg = 0;
+  for (const r of rows) mg += effectiveConcentration(r, settings) * flowAt(data, r);
+  return store.round(mg / Number(settings.tonsDivisor), 4);
+}
+
+// 全部排放口在某时段的已用量（吨）
+function usedInRange(data, metric, startDay, endDay) {
+  let total = 0;
+  for (const o of data.outlets) total += totalInRange(data, o.id, metric, startDay, endDay);
+  return store.round(total, 4);
+}
+
 // 月总量（吨）：逐小时浓度乘以流量相加
 function monthTotal(data, outletId, metric, month) {
-  const settings = data.settings;
-  const concRows = readingsOf(data, { outletId, metric, month }).filter((r) => isCounted(r, deviceOf(data, r.deviceId), settings));
-  const flowRows = readingsOf(data, { outletId, metric: '流量', month }).filter((r) => isCounted(r, deviceOf(data, r.deviceId), settings));
-  let mg = 0;
-  for (let i = 0; i < concRows.length; i += 1) {
-    const flow = flowRows[i] ? Number(flowRows[i].value) : 0;
-    mg += effectiveConcentration(concRows[i], settings) * flow;
-  }
-  return store.round(mg / Number(settings.tonsDivisor), 4);
+  const [start, end] = monthRange(month);
+  return totalInRange(data, outletId, metric, start, end);
 }
 
 // 季度总量：按当季日均乘以季节天数
@@ -143,22 +164,80 @@ function quarterTotal(data, outletId, metric, quarter) {
   return store.round((average / store.daysInMonth(months[0])) * 90, 4);
 }
 
-// 季度许可量：年度许可按季度平均分解
+// 季度许可量：按季度内各许可分段的年许可量 × 实际天数占许可年天数比例分解
 function quarterPermitTons(data, metric, quarter) {
-  const settings = data.settings;
-  const annual = metric === '氨氮' ? Number(settings.annualPermitAmmoniaTons) : Number(settings.annualPermitCodTons);
-  return store.round(annual / 4, 4);
+  const [y, q] = String(quarter).split('-Q').map(Number);
+  const firstMonth = y + '-' + String((q - 1) * 3 + 1).padStart(2, '0');
+  const lastMonth = y + '-' + String((q - 1) * 3 + 3).padStart(2, '0');
+  const start = firstMonth + '-01';
+  const end = monthRange(lastMonth)[1];
+  return permit.permitForRange(data, metric, start, end);
 }
 
-// 年累计：把库里的全部数据加起来
-function accumulatedTons(data, metric) {
-  const outlets = data.outlets.map((o) => o.id);
-  let total = 0;
-  for (const outletId of outlets) {
-    const months = Array.from(new Set(data.readings.filter((r) => r.outletId === outletId && r.metric === metric).map((r) => store.monthOf(r.at))));
-    for (const month of months) total += monthTotal(data, outletId, metric, month);
-  }
-  return store.round(total, 4);
+// 年累计：按许可年（设置里的许可年起始日）累计，跨许可年的数据不带入
+function accumulatedTons(data, metric, refDay) {
+  const ref = String(refDay || store.nowText().slice(0, 10)).slice(0, 10);
+  const year = store.permitYearOf(ref, data.settings.permitYearStart);
+  return usedInRange(data, metric, year.start, year.end);
+}
+
+// 剩余许可量结转：折合年许可 + 上年结转 − 许可年已用；分段给出每段口径与段内已用
+function permitBalance(data, metric, refDay) {
+  const ref = String(refDay || store.nowText().slice(0, 10)).slice(0, 10);
+  const segResult = permit.segmentsForYear(data, metric, ref);
+  const year = segResult.year;
+  const carried = permit.carryOverForYear(data, metric, year.start);
+  const segments = segResult.segments.map((s) => Object.assign({}, s, {
+    usedTons: usedInRange(data, metric, s.from, store.addDays(s.to, 1)),
+  }));
+  const equivalentAnnualTons = store.round(segResult.segments.reduce((acc, s) => acc + s.equivalentTons, 0), 4);
+  const usedTons = usedInRange(data, metric, year.start, year.end);
+  const remainingTons = store.round(equivalentAnnualTons + carried.tons - usedTons, 4);
+  // 上一许可年结存（跨年变更时对照「带多少」用）
+  const prevRef = store.addDays(year.start, -1);
+  const prevSeg = permit.segmentsForYear(data, metric, prevRef);
+  const prevCarried = permit.carryOverForYear(data, metric, prevSeg.year.start);
+  const prevEquivalent = store.round(prevSeg.segments.reduce((acc, s) => acc + s.equivalentTons, 0), 4);
+  const prevUsed = usedInRange(data, metric, prevSeg.year.start, prevSeg.year.end);
+  return {
+    metric,
+    yearStart: year.start,
+    yearEnd: store.addDays(year.end, -1),
+    yearDays: year.days,
+    yearLabel: year.label,
+    equivalentAnnualTons,
+    carriedTons: carried.tons,
+    carryOverItems: carried.items,
+    usedTons,
+    remainingTons,
+    segments,
+    prevYear: {
+      yearStart: prevSeg.year.start,
+      yearEnd: store.addDays(prevSeg.year.end, -1),
+      equivalentAnnualTons: prevEquivalent,
+      carriedTons: prevCarried.tons,
+      usedTons: prevUsed,
+      remainingTons: store.round(prevEquivalent + prevCarried.tons - prevUsed, 4),
+    },
+  };
+}
+
+// 某月核算用的许可信息：覆盖该月的版本、月/季许可量、许可年结转与剩余
+function permitBlock(data, metric, month) {
+  const [start, end] = monthRange(month);
+  const bal = permitBalance(data, metric, start);
+  const eff = permit.permitAt(data, metric, start);
+  return {
+    currentVersion: 'V' + eff.version,
+    currentAnnualTons: eff.tons,
+    versions: permit.versionsOfMonth(data, metric, month),
+    monthPermitTons: permit.permitForRange(data, metric, start, end),
+    quarterPermitTons: quarterPermitTons(data, metric, store.quarterOf(month)),
+    yearEquivalentTons: bal.equivalentAnnualTons,
+    carriedTons: bal.carriedTons,
+    usedTons: bal.usedTons,
+    remainingTons: bal.remainingTons,
+  };
 }
 
 // 超标：日均超过限值，或者小时值超过限值达到规定次数
@@ -210,6 +289,10 @@ function outletSummary(data, outletId, month) {
   const devices = data.devices.filter((d) => d.outletId === outletId).map((d) => Object.assign({}, d, {
     readingCount: data.readings.filter((r) => r.deviceId === d.id).length,
   }));
+  // 该月若已有「已上报」报表，结论以报表快照为准，这里只标记出来
+  const frozenReport = outlet
+    ? data.reports.find((r) => r.plantId === outlet.plantId && r.period === month && r.status === '已上报') || null
+    : null;
   return {
     outlet,
     plant: outlet ? plantOf(data, outlet.plantId) : null,
@@ -218,9 +301,16 @@ function outletSummary(data, outletId, month) {
     devices,
     quarterTotalCod: quarterTotal(data, outletId, 'COD', store.quarterOf(month)),
     permitCodTons: quarterPermitTons(data, 'COD', store.quarterOf(month)),
-    annualPermitCodTons: Number(settings.annualPermitCodTons),
-    accumulatedCodTons: accumulatedTons(data, 'COD'),
-    accumulatedAmmoniaTons: accumulatedTons(data, '氨氮'),
+    annualPermitCodTons: permit.permitAt(data, 'COD', month + '-01').tons,
+    accumulatedCodTons: accumulatedTons(data, 'COD', month + '-01'),
+    accumulatedAmmoniaTons: accumulatedTons(data, '氨氮', month + '-01'),
+    permitInfo: {
+      COD: permitBlock(data, 'COD', month),
+      氨氮: permitBlock(data, '氨氮', month),
+    },
+    frozenReport: frozenReport
+      ? { id: frozenReport.id, period: frozenReport.period, frozenAt: frozenReport.snapshot ? frozenReport.snapshot.frozenAt : '' }
+      : null,
     settings,
   };
 }
@@ -229,5 +319,6 @@ module.exports = {
   plantOf, outletOf, deviceOf,
   readingsOf, isCounted, effectiveConcentration, oxygenAt, flowAt,
   dayRows, dailyStats, dailySeries, monthAverage, monthTotal, quarterTotal, quarterPermitTons, accumulatedTons,
+  monthRange, totalInRange, usedInRange, permitBalance, permitBlock,
   exceedance, outletsOf, outletSummary,
 };
