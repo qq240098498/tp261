@@ -22,8 +22,18 @@ const DEFAULT_SETTINGS = {
 function normalize(raw) {
   const data = raw && typeof raw === 'object' ? raw : {};
   data.settings = Object.assign({}, DEFAULT_SETTINGS, data.settings || {});
-  for (const key of ['plants', 'outlets', 'devices', 'readings', 'reports']) {
+  // permitVersions：排污许可分段（变更登记）；findings 预留
+  for (const key of ['plants', 'outlets', 'devices', 'readings', 'reports', 'permitVersions']) {
     if (!Array.isArray(data[key])) data[key] = [];
+  }
+  // 老数据回填：月报快照数组、分段跨年结转政策
+  for (const r of data.reports) {
+    if (!Array.isArray(r.snapshots)) r.snapshots = [];
+  }
+  for (const v of data.permitVersions) {
+    if (!v.carryover || typeof v.carryover !== 'object') {
+      v.carryover = { COD: { mode: 'none', amount: 0 }, '氨氮': { mode: 'none', amount: 0 } };
+    }
   }
   return data;
 }
@@ -78,6 +88,31 @@ function daysInQuarter(quarter) {
   return total;
 }
 
+function isLeapYear(y) {
+  return (y % 4 === 0 && y % 100 !== 0) || y % 400 === 0;
+}
+
+function daysInYear(y) {
+  return isLeapYear(Number(y)) ? 366 : 365;
+}
+
+// 'YYYY-MM-DD' -> UTC Date（避免时区漂移）
+function toDate(dayText) {
+  const [y, m, d] = String(dayText).slice(0, 10).split('-').map(Number);
+  return new Date(Date.UTC(y, m - 1, d));
+}
+
+// 两个日期间的天数差（a - b），按日历日；diffDays(end, start) 即区间天数
+function diffDays(aText, bText) {
+  return Math.round((toDate(aText) - toDate(bText)) / 86400000);
+}
+
+function addDaysText(dayText, n) {
+  const dt = new Date(toDate(dayText).getTime() + Number(n) * 86400000);
+  const p = (x) => String(x).padStart(2, '0');
+  return dt.getUTCFullYear() + '-' + p(dt.getUTCMonth() + 1) + '-' + p(dt.getUTCDate());
+}
+
 function monthOf(at) {
   return String(at).slice(0, 7);
 }
@@ -98,6 +133,7 @@ function nowText() {
 }
 
 module.exports = {
-  load, save, nextId, normalize, round, daysInMonth, daysInQuarter, monthOf, dayOf, quarterOf, nowText,
+  load, save, nextId, normalize, round, daysInMonth, daysInQuarter, daysInYear, isLeapYear,
+  toDate, diffDays, addDaysText, monthOf, dayOf, quarterOf, nowText,
   DEFAULT_SETTINGS, dataFile,
 };

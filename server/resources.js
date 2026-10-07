@@ -10,6 +10,224 @@ const METRICS = ['COD', '氨氮', '流量', '氧含量'];
 const FLAGS = ['有效', '无效'];
 const SOURCES = ['自动', '补录'];
 const REPORT_STATUS = ['草稿', '已上报', '退回'];
+const CARRY_MODES = ['none', 'full', 'fixed'];
+const CARRY_LABELS = { none: '不结转', full: '上年结余全额结转', fixed: '指定结余量' };
+
+function isValidDay(text) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(text || ''))) return false;
+  const [y, m, d] = String(text).split('-').map(Number);
+  if (m < 1 || m > 12 || d < 1 || d > store.daysInMonth(y + '-' + String(m).padStart(2, '0'))) return false;
+  return y >= 2000 && y <= 2100;
+}
+
+// ---------- 排污许可分段（变更登记） ----------
+
+// 该生效日的版本是否为其许可年的开户段（许可年内最早一条，且前一段在更早许可年）
+// predVersions：已存在版本（校验新建时不含候选自身）
+function boundaryAmong(plant, versions, effectiveFrom) {
+  const yIdx = monitor.permitYearIndex(plant, effectiveFrom);
+  const earlier = versions.filter((v) => v.effectiveFrom < effectiveFrom);
+  const sameYearEarlier = versions.some((v) => v.effectiveFrom < effectiveFrom && monitor.permitYearIndex(plant, v.effectiveFrom) === yIdx);
+  if (sameYearEarlier) return false; // 许可年内已有更早登记，本版不是开户段
+  const anchor = earlier.length ? earlier[earlier.length - 1].effectiveFrom : String(plant.permitYearStart);
+  return monitor.permitYearIndex(plant, anchor) < yIdx;
+}
+
+function isBoundaryVersion(data, plant, effectiveFrom) {
+  return boundaryAmong(plant, monitor.plantVersions(data, plant.id), effectiveFrom);
+}
+
+// 装饰用：某条已存在版本是否跨年开户（排除自身）
+function versionBoundaryFlag(data, plant, version) {
+  const others = monitor.plantVersions(data, plant.id).filter((x) => x.id !== version.id);
+  return boundaryAmong(plant, others, version.effectiveFrom);
+}
+
+// 已上报快照引用过的版本一律冻结（报表当前状态无关，保护当时结论）
+function frozenVersionMap(data) {
+  const map = {};
+  for (const r of data.reports) {
+    for (const snap of r.snapshots || []) {
+      for (const vid of snap.versionIds || []) {
+        map[vid] = { reportId: r.id, seq: snap.seq, savedAt: snap.savedAt, savedBy: snap.savedBy || '' };
+      }
+    }
+  }
+  return map;
+}
+
+function carryLabel(v, metric) {
+  const c = (v.carryover || {})[metric] || {};
+  return CARRY_LABELS[c.mode] || '不结转';
+}
+
+function decorateVersion(data, v) {
+  const plant = monitor.plantOf(data, v.plantId);
+  const frozen = frozenVersionMap(data);
+  const versions = monitor.plantVersions(data, v.plantId);
+  return Object.assign({}, v, {
+    plantCode: plant ? plant.code : '',
+    plantName: plant ? plant.name : '',
+    frozen: !!frozen[v.id],
+    boundary: versionBoundaryFlag(data, plant, v),
+    isLatest: versions.length ? versions[versions.length - 1].id === v.id : true,
+    carryLabels: { COD: carryLabel(v, 'COD'), '氨氮': carryLabel(v, '氨氮') },
+  });
+}
+
+function listPermitVersions(data, query) {
+  const q = query || {};
+  let rows = (data.permitVersions || []).slice();
+  if (q.plantId) rows = rows.filter((v) => v.plantId === q.plantId);
+  return rows.map((v) => decorateVersion(data, v))
+    .sort((a, b) => (a.plantId === b.plantId ? (a.effectiveFrom < b.effectiveFrom ? -1 : 1) : a.plantId < b.plantId ? -1 : 1));
+}
+
+function permitDetail(data, plantId) {
+  const plant = data.plants.find((p) => p.id === plantId);
+  if (!plant) throw new AppError(404, 'PLANT_NOT_FOUND', '这个排污单位不存在');
+  const versions = monitor.plantVersions(data, plantId).map((v) => decorateVersion(data, v));
+  return {
+    plant,
+    versions,
+    synthetic: monitor.syntheticVersion(data, plant),
+  };
+}
+
+function normalizeCarryover(payload) {
+  const out = {};
+  for (const metric of monitor.PERMIT_METRICS) {
+    const c = (payload && payload[metric]) || {};
+    const mode = CARRY_MODES.includes(c.mode) ? c.mode : 'none';
+    out[metric] = { mode, amount: mode === 'fixed' ? store.round(Number(c.amount), 4) : 0 };
+  }
+  return out;
+}
+
+function validatePermitVersion(data, plant, payload, current) {
+  const errors = {};
+  const effectiveFrom = current ? current.effectiveFrom : payload.effectiveFrom;
+  if (!isValidDay(effectiveFrom)) errors.effectiveFrom = '生效日要像 2026-09-10，且是真实日期';
+  for (const [field, label] of [['codTons', 'COD 年许可量'], ['ammoniaTons', '氨氮年许可量']]) {
+    const v = Number(payload[field]);
+    if (!Number.isFinite(v) || v < 0) errors[field] = label + '要是不小于 0 的数字';
+  }
+  if (!String(payload.documentRef || '').trim()) errors.documentRef = '依据文件不能为空（批复/变更文件名称或文号）';
+  if (!String(payload.registeredBy || '').trim()) errors.registeredBy = '登记人不能为空';
+  // 新建：允许补登历史日期（如事后补登新许可年生效版本），但同日不得重复
+  if (!current && isValidDay(effectiveFrom)) {
+    if (monitor.plantVersions(data, plant.id).some((v) => v.effectiveFrom === effectiveFrom)) {
+      throw new AppError(409, 'VERSION_DATE_CONFLICT', '该生效日已经登记过一次变更', { effectiveFrom });
+    }
+  }
+  // 跨年开户段：结转方式逐指标校验
+  const boundary = current ? false : isBoundaryVersion(data, plant, effectiveFrom);
+  const carry = (payload.carryover && typeof payload.carryover === 'object') ? payload.carryover : {};
+  for (const metric of monitor.PERMIT_METRICS) {
+    const c = carry[metric] || {};
+    if (boundary) {
+      if (!CARRY_MODES.includes(c.mode)) errors['carryover.' + metric + '.mode'] = '请选择上年余额结转方式';
+      if (c.mode === 'fixed' && (!Number.isFinite(Number(c.amount)) || Number(c.amount) < 0)) {
+        errors['carryover.' + metric + '.amount'] = '指定结余量要是不小于 0 的数字（吨）';
+      }
+    }
+  }
+  if (Object.keys(errors).length) throw new AppError(400, 'VALIDATION_FAILED', '变更登记有几项没通过校验', errors);
+  return { boundary };
+}
+
+function createPermitVersion(data, payload) {
+  const plant = data.plants.find((p) => p.id === payload.plantId);
+  if (!plant) throw new AppError(400, 'VALIDATION_FAILED', '变更登记没通过校验', { plantId: '排污单位不存在' });
+  const { boundary } = validatePermitVersion(data, plant, payload, null);
+  const version = {
+    id: store.nextId('pv', data.permitVersions),
+    plantId: plant.id,
+    effectiveFrom: String(payload.effectiveFrom),
+    codTons: store.round(Number(payload.codTons), 4),
+    ammoniaTons: store.round(Number(payload.ammoniaTons), 4),
+    documentRef: String(payload.documentRef).trim(),
+    registeredBy: String(payload.registeredBy).trim(),
+    registeredAt: store.nowText(),
+    carryover: boundary ? normalizeCarryover(payload.carryover) : { COD: { mode: 'none', amount: 0 }, '氨氮': { mode: 'none', amount: 0 } },
+    remark: String(payload.remark || ''),
+  };
+  data.permitVersions.push(version);
+  return decorateVersion(data, version);
+}
+
+function updatePermitVersion(data, id, payload) {
+  const version = data.permitVersions.find((v) => v.id === id);
+  if (!version) throw new AppError(404, 'VERSION_NOT_FOUND', '这条变更登记不存在');
+  const frozen = frozenVersionMap(data);
+  if (frozen[id]) {
+    throw new AppError(409, 'VERSION_FROZEN', '该版本已被已上报月报快照引用（' + frozen[id].reportId + ' 第 ' + frozen[id].seq + ' 次冻结），数值不能再改', frozen[id]);
+  }
+  const illegal = ['plantId', 'effectiveFrom', 'registeredAt'].filter((k) => payload[k] !== undefined);
+  if (illegal.length) {
+    throw new AppError(400, 'VALIDATION_FAILED', '排污单位、生效日、登记时刻不可修改', Object.fromEntries(illegal.map((k) => [k, '不可修改字段'])));
+  }
+  const plant = data.plants.find((p) => p.id === version.plantId);
+  const merged = Object.assign({}, version, payload);
+  validatePermitVersion(data, plant, merged, version);
+  Object.assign(version, {
+    codTons: store.round(Number(merged.codTons), 4),
+    ammoniaTons: store.round(Number(merged.ammoniaTons), 4),
+    documentRef: String(merged.documentRef).trim(),
+    registeredBy: String(merged.registeredBy).trim(),
+    remark: String(merged.remark !== undefined ? merged.remark : version.remark),
+  });
+  return decorateVersion(data, version);
+}
+
+function removePermitVersion(data, id) {
+  const version = data.permitVersions.find((v) => v.id === id);
+  if (!version) throw new AppError(404, 'VERSION_NOT_FOUND', '这条变更登记不存在');
+  const frozen = frozenVersionMap(data);
+  if (frozen[id]) {
+    throw new AppError(409, 'VERSION_FROZEN', '该版本已被已上报月报快照引用，不能删除', frozen[id]);
+  }
+  const versions = monitor.plantVersions(data, version.plantId);
+  if (versions[versions.length - 1].id !== id) {
+    throw new AppError(409, 'VERSION_HAS_SUCCESSOR', '只能删除最后一条变更登记，中间版本要保留以维持分段链', { latest: versions[versions.length - 1].id });
+  }
+  data.permitVersions = data.permitVersions.filter((v) => v.id !== id);
+  return { removed: id };
+}
+
+// 许可年台账：逐月给出分段构成、月许可/已用、年累计与剩余，以及该月冻结记录
+function plantLedger(data, plantId, query) {
+  const plant = data.plants.find((p) => p.id === plantId);
+  if (!plant) throw new AppError(404, 'PLANT_NOT_FOUND', '这个排污单位不存在');
+  const q = query || {};
+  const monthSet = new Set();
+  for (const r of data.readings) {
+    const o = data.outlets.find((x) => x.id === r.outletId);
+    if (o && o.plantId === plantId) monthSet.add(store.monthOf(r.at));
+  }
+  for (const v of monitor.plantVersions(data, plantId)) monthSet.add(v.effectiveFrom.slice(0, 7));
+  for (const r of data.reports) if (r.plantId === plantId) monthSet.add(r.period);
+  monthSet.add(String(plant.permitYearStart || data.settings.permitYearStart).slice(0, 7));
+  const all = Array.from(monthSet).sort();
+  const from = /^\d{4}-\d{2}$/.test(q.from) ? q.from : all[0];
+  const to = /^\d{4}-\d{2}$/.test(q.to) ? q.to : all[all.length - 1];
+  const months = [];
+  let cur = from;
+  while (cur <= to) {
+    months.push(cur);
+    const [y, m] = cur.split('-').map(Number);
+    cur = (m === 12 ? y + 1 + '-01' : y + '-' + String(m + 1).padStart(2, '0'));
+  }
+  const rows = months.map((month) => {
+    const acc = monitor.plantMonthAccounting(data, plantId, month);
+    const frozenMonths = data.reports.filter((r) => r.plantId === plantId && r.period === month)
+      .flatMap((r) => (r.snapshots || []).map((s) => ({
+        reportId: r.id, status: r.status, seq: s.seq, savedAt: s.savedAt, savedBy: s.savedBy || '', versionIds: s.versionIds || [],
+      })));
+    return Object.assign({}, acc, { frozen: frozenMonths });
+  });
+  return { plant, months: rows };
+}
 
 function decoratePlant(data, plant, month) {
   const outlets = monitor.outletsOf(data, plant.id);
@@ -46,7 +264,12 @@ function plantDetail(data, id) {
       deviceCount: data.devices.filter((d) => d.outletId === o.id).length,
       readingCount: data.readings.filter((r) => r.outletId === o.id).length,
     })),
-    reports: data.reports.filter((r) => r.plantId === plant.id).sort((a, b) => (a.period < b.period ? 1 : -1)),
+    reports: data.reports.filter((r) => r.plantId === plant.id).map((r) => ({
+      id: r.id, plantId: r.plantId, period: r.period, status: r.status,
+      submittedAt: r.submittedAt, submittedBy: r.submittedBy, remark: r.remark,
+      snapshotCount: Array.isArray(r.snapshots) ? r.snapshots.length : 0,
+      frozen: Array.isArray(r.snapshots) && r.snapshots.length > 0,
+    })).sort((a, b) => (a.period < b.period ? 1 : -1)),
     findings: (data.findings || []).filter((f) => f.plantId === plant.id),
   });
 }
@@ -100,6 +323,7 @@ function removePlant(data, id) {
   const used = outlets.length + data.readings.filter((r) => outlets.some((o) => o.id === r.outletId)).length;
   if (used > 0) throw new AppError(409, 'PLANT_IN_USE', '名下还有排放口与监测数据，不能删除', { count: used });
   data.plants = data.plants.filter((p) => p.id !== id);
+  data.permitVersions = data.permitVersions.filter((v) => v.plantId !== id);
   return { removed: id };
 }
 
@@ -320,35 +544,57 @@ function listReports(data, query) {
   if (q.status) rows = rows.filter((r) => r.status === q.status);
   return rows.map((r) => {
     const plant = monitor.plantOf(data, r.plantId);
-    return Object.assign({}, r, { plantCode: plant ? plant.code : '', plantName: plant ? plant.name : '' });
+    const snapshotCount = Array.isArray(r.snapshots) ? r.snapshots.length : 0;
+    return Object.assign({}, r, {
+      plantCode: plant ? plant.code : '',
+      plantName: plant ? plant.name : '',
+      snapshotCount,
+      frozen: snapshotCount > 0,
+      snapshots: undefined
+    });
   }).sort((a, b) => (a.period < b.period ? 1 : -1));
 }
 
-function reportDetail(data, id) {
+function reportDetail(data, id, query) {
   const report = data.reports.find((r) => r.id === id);
   if (!report) throw new AppError(404, 'REPORT_NOT_FOUND', '这张报表不存在');
   const plant = monitor.plantOf(data, report.plantId);
   const month = String(report.period).slice(0, 7);
   const outlets = monitor.outletsOf(data, report.plantId).map((o) => monitor.outletSummary(data, o.id, month));
-  return Object.assign({}, report, { plant, month, outlets });
+  const snapshots = report.snapshots || [];
+  const out = Object.assign({}, report, {
+    plant, month, outlets,
+    frozen: snapshots.length > 0,
+    snapshot: snapshots.length ? snapshots[snapshots.length - 1] : null,
+    snapshotHistory: snapshots.map((s) => ({ seq: s.seq, savedAt: s.savedAt, savedBy: s.savedBy, conclusion: s.conclusion, permitYear: s.permitYear })),
+  });
+  if (query && query.compare === '1') out.live = monitor.plantMonthAccounting(data, report.plantId, month);
+  return out;
 }
 
 function createReport(data, payload) {
   const errors = {};
   if (!data.plants.some((p) => p.id === payload.plantId)) errors.plantId = '排污单位不存在';
   if (!/^\d{4}-\d{2}$/.test(String(payload.period || ''))) errors.period = '期间要像 2026-09';
+  const status = REPORT_STATUS.includes(payload.status) ? payload.status : '草稿';
+  if (status === '已上报' && !String(payload.submittedBy || '').trim()) errors.submittedBy = '上报时上报人不能为空';
+  if (data.reports.some((r) => r.plantId === payload.plantId && r.period === payload.period)) {
+    throw new AppError(409, 'REPORT_DUPLICATE_PERIOD', '这个单位这个月已经有一张月报了', { plantId: payload.plantId, period: payload.period });
+  }
   if (Object.keys(errors).length) throw new AppError(400, 'VALIDATION_FAILED', '这张报表没通过校验', errors);
   const report = {
     id: store.nextId('rp', data.reports),
     plantId: payload.plantId,
     period: String(payload.period),
-    status: payload.status || '草稿',
-    submittedAt: payload.submittedAt || '',
-    submittedBy: String(payload.submittedBy || ''),
+    status,
+    submittedAt: status === '已上报' ? store.nowText() : '',
+    submittedBy: status === '已上报' ? String(payload.submittedBy).trim() : '',
     remark: String(payload.remark || ''),
+    snapshots: [],
   };
   data.reports.push(report);
-  return report;
+  if (status === '已上报') report.snapshots.push(monitor.buildReportSnapshot(data, report, report.submittedBy));
+  return reportDetail(data, report.id, null);
 }
 
 function updateReport(data, id, payload) {
@@ -357,11 +603,34 @@ function updateReport(data, id, payload) {
   if (payload.status && !REPORT_STATUS.includes(payload.status)) {
     throw new AppError(400, 'VALIDATION_FAILED', '状态只能是：' + REPORT_STATUS.join('、'), { status: '状态取值不对' });
   }
-  if (payload.status) report.status = payload.status;
-  if (payload.submittedAt !== undefined) report.submittedAt = String(payload.submittedAt);
-  if (payload.submittedBy !== undefined) report.submittedBy = String(payload.submittedBy);
+  // 已上报且已有冻结快照：只许改备注、退回；退回后快照保留
+  // （存量老数据：状态已是已上报但没有快照时不加锁，允许补做第一次冻结）
+  const hasSnapshots = (report.snapshots || []).length > 0;
+  if (report.status === '已上报' && hasSnapshots) {
+    const blocked = Object.keys(payload).filter((k) => !['status', 'remark'].includes(k));
+    const illegalStatus = payload.status && payload.status !== '退回';
+    if (blocked.length || illegalStatus) {
+      const details = Object.fromEntries(blocked.map((k) => [k, '月报已上报冻结，该字段不能改']));
+      if (illegalStatus) details.status = '已上报月报只能先退回';
+      throw new AppError(409, 'REPORT_LOCKED', '这张月报已上报冻结：只能改备注或退回，退回后可重新上报生成新快照', details);
+    }
+  }
+  const nextStatus = payload.status || report.status;
+  const submitting = nextStatus === '已上报' && !(report.snapshots || []).length;
+  let submittedBy = report.submittedBy;
+  if (payload.submittedBy !== undefined) submittedBy = String(payload.submittedBy).trim();
+  if (submitting && !submittedBy) {
+    throw new AppError(400, 'VALIDATION_FAILED', '上报时上报人不能为空', { submittedBy: '上报人不能为空' });
+  }
   if (payload.remark !== undefined) report.remark = String(payload.remark);
-  return report;
+  if (payload.status) report.status = payload.status;
+  if (submitting) {
+    report.submittedAt = store.nowText();
+    report.submittedBy = submittedBy;
+    report.snapshots = report.snapshots || [];
+    report.snapshots.push(monitor.buildReportSnapshot(data, report, submittedBy));
+  }
+  return reportDetail(data, id, null);
 }
 
 module.exports = {
@@ -370,5 +639,6 @@ module.exports = {
   listDevices, createDevice, updateDevice, removeDevice,
   listReadings, createReading, updateReading, removeReading, decorateReading,
   listReports, reportDetail, createReport, updateReport,
-  PLANT_STATUS, OUTLET_STATUS, OUTLET_TYPE, DEVICE_STATUS, METRICS, FLAGS, SOURCES, REPORT_STATUS,
+  listPermitVersions, permitDetail, createPermitVersion, updatePermitVersion, removePermitVersion, plantLedger,
+  PLANT_STATUS, OUTLET_STATUS, OUTLET_TYPE, DEVICE_STATUS, METRICS, FLAGS, SOURCES, REPORT_STATUS, CARRY_MODES, CARRY_LABELS,
 };

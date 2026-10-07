@@ -13,6 +13,11 @@
   var FLAGS = ['有效', '无效'];
   var SOURCES = ['自动', '补录'];
   var REPORT_STATUS = ['草稿', '已上报', '退回'];
+  var CARRY_MODES = [
+    { value: 'none', label: '不结转' },
+    { value: 'full', label: '上年结余全额结转' },
+    { value: 'fixed', label: '指定结余量' }
+  ];
 
   /* ================= 全局状态 ================= */
   var state = {
@@ -26,11 +31,13 @@
     devices: [],
     reports: [],
     readings: { total: 0, returned: 0, rows: [] },
+    permitVersions: [],
     plantsFilter: { status: '', keyword: '' },
     outletsFilter: { plantId: '', status: '' },
     devicesFilter: { outletId: '', metric: '', status: '' },
     readingsFilter: { outletId: '', deviceId: '', metric: '', day: '', month: '' },
-    accounting: { outletId: '', month: '', metric: 'COD' }
+    accounting: { outletId: '', month: '', metric: 'COD' },
+    permitsFilter: { plantId: '' }
   };
 
   /* ================= 基础工具 ================= */
@@ -299,7 +306,8 @@
       api('GET', '/api/outlets'),
       api('GET', '/api/devices'),
       api('GET', '/api/readings'),
-      api('GET', '/api/reports')
+      api('GET', '/api/reports'),
+      api('GET', '/api/permit-versions')
     ]);
     state.summary = res[0];
     state.settings = res[1];
@@ -308,6 +316,7 @@
     state.devices = res[4];
     state.readings = res[5];
     state.reports = res[6];
+    state.permitVersions = res[7];
     state.today = state.summary.today;
     state.month = state.summary.month;
     if (!state.accounting.outletId && state.outlets.length) state.accounting.outletId = state.outlets[0].id;
@@ -320,13 +329,15 @@
       api('GET', '/api/outlets'),
       api('GET', '/api/devices'),
       api('GET', '/api/reports'),
-      api('GET', '/api/summary')
+      api('GET', '/api/summary'),
+      api('GET', '/api/permit-versions')
     ]);
     state.plants = res[0];
     state.outlets = res[1];
     state.devices = res[2];
     state.reports = res[3];
     state.summary = res[4];
+    state.permitVersions = res[5];
   }
 
   function afterMutation(msg) {
@@ -347,6 +358,7 @@
     else if (view === 'devices') renderDevices();
     else if (view === 'readings') renderReadings();
     else if (view === 'accounting') renderAccounting();
+    else if (view === 'permits') renderPermits();
   }
 
   /* ================= 概览 ================= */
@@ -962,6 +974,86 @@
     });
   }
 
+  function frozenBanner(rep) {
+    var snap = rep.snapshot;
+    var box = h('div', { class: 'frozen-banner' });
+    box.appendChild(h('div', { class: 'frozen-head' }, [
+      h('span', { class: 'tag tag-frozen', text: '已冻结快照 #' + snap.seq }),
+      h('b', { text: '冻结时刻 ' + snap.savedAt + '　登记/上报人 ' + textOf(snap.savedBy) }),
+      h('span', { class: 'sub', text: '许可年 ' + snap.permitYear + ' · 以下数字按当时适用版本核算，之后的变更与补录不会改写' }),
+      h('span', { class: 'tag ' + (MAIN_METRICS.some(function (x) { return snap.totals[x].overdrawn; }) ? 'tag-danger' : 'tag-ok'),
+        text: MAIN_METRICS.some(function (x) { return snap.totals[x].overdrawn; }) ? '总量超支' : '总量结论：正常' })
+    ]));
+    var segLines = [];
+    MAIN_METRICS.forEach(function (metric) {
+      (snap.metrics[metric].segments || []).forEach(function (p) {
+        segLines.push(metric + '：' + (p.synthetic ? '系统默认许可' : p.versionId) +
+          '（' + p.start + ' 起 ' + p.days + ' 天，依据：' + (p.documentRef || '—') + '）');
+      });
+    });
+    box.appendChild(h('div', { class: 'section-note' }, Array.from(new Set(segLines)).map(function (t) { return h('div', { text: t }); })));
+    var tb = h('tbody');
+    MAIN_METRICS.forEach(function (metric) {
+      var t = snap.totals[metric];
+      tb.appendChild(h('tr', {}, [
+        h('td', { text: metric }),
+        h('td', { class: 'mono', text: fmt(t.monthPermit, 4) }),
+        h('td', { class: 'mono', text: fmt(t.monthUsed, 4) }),
+        h('td', { class: 'mono', text: fmt(t.carryIn, 4) }),
+        h('td', { class: 'mono', text: fmt(t.ytdPermit, 4) }),
+        h('td', { class: 'mono', text: fmt(t.ytdUsed, 4) }),
+        h('td', { class: 'mono ' + (t.remaining < 0 ? 'num-danger' : 'num-ok'), text: fmt(t.remaining, 4) })
+      ]));
+    });
+    box.appendChild(h('div', { class: 'table-wrap' }, h('table', { class: 'mini-table' }, [
+      h('thead', {}, h('tr', {}, [
+        h('th', { text: '指标' }), h('th', { text: '月许可' }), h('th', { text: '月已用' }),
+        h('th', { text: '上年带入' }), h('th', { text: '累计许可' }), h('th', { text: '累计已用' }), h('th', { text: '剩余(吨)' })
+      ])),
+      tb
+    ])));
+    var history = (rep.snapshotHistory || []);
+    if (history.length > 1) {
+      box.appendChild(h('div', { class: 'sub' }, '历史冻结：' + history.map(function (x) { return '#' + x.seq + ' ' + x.savedAt; }).join('；')));
+    }
+    var diffHolder = h('div');
+    var btn = h('button', { type: 'button', class: 'btn btn-sm btn-ghost', text: '按当前数据试算对比' });
+    var loaded = false;
+    btn.addEventListener('click', function () {
+      if (loaded) { loaded = false; clear(diffHolder); btn.textContent = '按当前数据试算对比'; return; }
+      btn.disabled = true; btn.textContent = '试算中…';
+      api('GET', '/api/reports/' + rep.id + '?compare=1').then(function (cmp) {
+        btn.disabled = false; btn.textContent = '收起试算'; loaded = true;
+        clear(diffHolder);
+        var tb2 = h('tbody');
+        var lines = [['月许可(吨)', 'monthPermit'], ['月已用(吨)', 'monthUsed'], ['累计许可(吨)', 'ytdPermit'], ['累计已用(吨)', 'ytdUsed'], ['剩余(吨)', 'remaining']];
+        MAIN_METRICS.forEach(function (metric) {
+          var f = snap.totals[metric], l = cmp.live.metrics[metric];
+          lines.forEach(function (pair) {
+            var delta = Number((Number(l[pair[1]]) - Number(f[pair[1]])).toFixed(4));
+            tb2.appendChild(h('tr', {}, [
+              h('td', { text: metric }), h('td', { text: pair[0] }),
+              h('td', { class: 'mono', text: fmt(f[pair[1]], 4) }),
+              h('td', { class: 'mono', text: fmt(l[pair[1]], 4) }),
+              h('td', { class: 'mono ' + (delta > 0 ? 'num-ok' : delta < 0 ? 'num-danger' : ''), text: (delta > 0 ? '+' : '') + fmt(delta, 4) })
+            ]));
+          });
+          var fSeg = f && snap.metrics[metric].segments.map(function (p) { return (p.synthetic ? '默认' : p.versionId) + p.days + '天'; }).join('·');
+          var lSeg = l.segments.map(function (p) { return (p.synthetic ? '默认' : p.versionId) + p.days + '天'; }).join('·');
+          tb2.appendChild(h('tr', {}, [h('td', { text: metric }), h('td', { text: '分段构成' }), h('td', { class: 'sub', text: fSeg }), h('td', { class: 'sub', text: lSeg }), h('td')]));
+        });
+        diffHolder.appendChild(h('div', { class: 'section-note', text: '试算仅供核对：已上报结论仍以上方冻结快照为准。' }));
+        diffHolder.appendChild(h('div', { class: 'table-wrap' }, h('table', { class: 'mini-table' }, [
+          h('thead', {}, h('tr', {}, [h('th', { text: '指标' }), h('th', { text: '项目' }), h('th', { text: '冻结值' }), h('th', { text: '当前试算' }), h('th', { text: '差异' })])),
+          tb2
+        ])));
+      }).catch(function (e) { btn.disabled = false; btn.textContent = '按当前数据试算对比'; showError(e); });
+    });
+    box.appendChild(h('div', { class: 'btn-row' }, [btn]));
+    box.appendChild(diffHolder);
+    return box;
+  }
+
   async function reportDetailNode(id) {
     var rep = await api('GET', '/api/reports/' + id);
     var box = h('div');
@@ -969,6 +1061,7 @@
       h('b', { text: '单位：' }), rep.plant ? ((rep.plant.code || '') + ' ' + (rep.plant.name || '')) : '—',
       '　', h('b', { text: '期间：' }), rep.period, '　', h('b', { text: '月份：' }), rep.month
     ]));
+    if (rep.frozen && rep.snapshot) box.appendChild(frozenBanner(rep));
     var outs = rep.outlets || [];
     if (!outs.length) box.appendChild(h('div', { class: 'empty', text: '该单位本月没有排放口数据' }));
     outs.forEach(function (os) {
@@ -1035,9 +1128,20 @@
     statusSel.addEventListener('click', function (e) { e.stopPropagation(); });
     statusSel.addEventListener('change', function (e) {
       e.stopPropagation();
-      api('PATCH', '/api/reports/' + r.id, { status: statusSel.value }).then(function () {
-        return afterMutation('报表状态已改为 ' + statusSel.value);
-      }).catch(function (err) { showError(err); statusSel.value = r.status; });
+      var want = statusSel.value;
+      var proceed = function () {
+        var payload = { status: want };
+        if (want === '已上报') payload.submittedBy = r.submittedBy || window.prompt('上报即按当前数据冻结当月许可核算快照（之后不可改写）。请填写上报人：') || '';
+        if (want === '已上报' && !payload.submittedBy) { statusSel.value = r.status; return; }
+        api('PATCH', '/api/reports/' + r.id, payload).then(function () {
+          return afterMutation('报表状态已改为 ' + want);
+        }).catch(function (err) { showError(err); statusSel.value = r.status; });
+      };
+      if (want === '已上报' && !(r.snapshotCount > 0) && !window.confirm('上报后将按当前数据冻结当月许可核算快照，已上报月份不再被许可变更或数据补录改写。确认上报？')) {
+        statusSel.value = r.status;
+        return;
+      }
+      proceed();
     });
     var actions = actionsCell([
       statusSel,
@@ -1065,6 +1169,8 @@
     var save = h('button', { type: 'button', class: 'btn btn-accent', text: '新建报表' });
     save.addEventListener('click', function () {
       var payload = collectForm(form);
+      if (payload.status === '已上报' && !payload.submittedBy.trim()) { showError(Object.assign(new Error('上报时上报人不能为空'), { details: { submittedBy: '上报人不能为空' } })); return; }
+      if (payload.status === '已上报' && !window.confirm('直接按「已上报」新建将立即冻结当月许可核算快照。确认？')) return;
       api('POST', '/api/reports', payload).then(function () { closeModal(); return afterMutation('报表已新建'); }).catch(showError);
     });
     openModal('新建报表', form, [
@@ -1073,19 +1179,23 @@
   }
 
   function openReportEdit(r) {
-    var fields = [
-      { name: 'status', label: '状态', type: 'select', options: REPORT_STATUS },
-      { name: 'submittedAt', label: '上报时刻' },
-      { name: 'submittedBy', label: '上报人' },
-      { name: 'remark', label: '备注', full: true }
-    ];
+    var locked = r.status === '已上报' && r.snapshotCount > 0;
+    var fields = locked
+      ? [{ name: 'status', label: '状态（已上报只能退回）', type: 'select', options: ['已上报', '退回'] },
+         { name: 'remark', label: '备注', full: true }]
+      : [
+        { name: 'status', label: '状态', type: 'select', options: REPORT_STATUS },
+        { name: 'submittedAt', label: '上报时刻' },
+        { name: 'submittedBy', label: '上报人' },
+        { name: 'remark', label: '备注', full: true }
+      ];
     var form = buildForm(fields, r);
     var save = h('button', { type: 'button', class: 'btn btn-accent', text: '保存' });
     save.addEventListener('click', function () {
       var payload = collectForm(form);
       api('PATCH', '/api/reports/' + r.id, payload).then(function () { closeModal(); return afterMutation('报表已更新'); }).catch(showError);
     });
-    openModal('修改报表', form, [
+    openModal(locked ? '修改报表（已冻结，只能改备注或退回）' : '修改报表', form, [
       h('button', { type: 'button', class: 'btn btn-ghost', text: '取消', onclick: closeModal }), save
     ]);
   }
@@ -1171,6 +1281,296 @@
     ]));
   }
 
+  /* ================= 许可变更（分段核算） ================= */
+  function versionsOfPlant(plantId) {
+    return state.permitVersions.filter(function (v) { return v.plantId === plantId; })
+      .slice().sort(function (a, b) { return a.effectiveFrom < b.effectiveFrom ? -1 : 1; });
+  }
+
+  // 与后端 permitYearIndex 同口径：某日相对许可年起始日落在哪一许可年
+  function clientYearIndex(permitYearStart, day) {
+    var b = permitYearStart.split('-').map(Number);
+    var d = day.split('-').map(Number);
+    var idx = d[0] - b[0];
+    if (d[1] < b[1] || (d[1] === b[1] && d[2] < b[2])) idx -= 1;
+    return idx;
+  }
+
+  // 选的生效日是否跨年开户（与后端 boundaryAmong 同口径）
+  function isBoundaryDay(plant, versions, day) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) return false;
+    var yIdx = clientYearIndex(plant.permitYearStart, day);
+    var earlier = versions.filter(function (v) { return v.effectiveFrom < day; });
+    var sameYearEarlier = earlier.some(function (v) { return clientYearIndex(plant.permitYearStart, v.effectiveFrom) === yIdx; });
+    if (sameYearEarlier) return false;
+    var anchor = earlier.length ? earlier[earlier.length - 1].effectiveFrom : plant.permitYearStart;
+    return clientYearIndex(plant.permitYearStart, anchor) < yIdx;
+  }
+
+  function versionTag(seg) {
+    if (seg.synthetic) return h('span', { class: 'tag tag-warn', text: '系统默认' });
+    return h('span', { class: 'tag tag-ok', text: seg.versionId });
+  }
+
+  function permitTimeline(plant) {
+    var versions = versionsOfPlant(plant.id);
+    var tb = h('tbody');
+    // 合成段（系统默认）始终第一行
+    tb.appendChild(h('tr', { class: 'row' }, [
+      h('td', { text: plant.permitYearStart }),
+      h('td', {}, h('span', { class: 'tag tag-warn', text: '系统默认' })),
+      h('td', { class: 'mono', text: fmt(state.settings ? state.settings.annualPermitCodTons : '', 2) }),
+      h('td', { class: 'mono', text: fmt(state.settings ? state.settings.annualPermitAmmoniaTons : '', 2) }),
+      h('td', { class: 'nowrap', text: '设置中的年许可量（未登记变更的时段兜底）' }),
+      h('td', { text: '—' }), h('td', { text: '—' }),
+      h('td', { text: versions.length ? '生效至 ' + versions[0].effectiveFrom + ' 前一日' : '现行' }),
+      h('td')
+    ]));
+    versions.forEach(function (v) {
+      var acts = h('div', { class: 'inline-actions' });
+      if (v.frozen) {
+        acts.appendChild(h('span', { class: 'tag tag-frozen', text: '已冻结' }));
+      } else {
+        acts.appendChild(actionBtn('修改', function () { openPermitVersionForm(plant, v); }));
+        if (v.isLatest) acts.appendChild(deleteBtn('删除', function () {
+          return api('DELETE', '/api/permit-versions/' + v.id).then(function () { return afterMutation('变更登记已删除'); });
+        }));
+      }
+      tb.appendChild(h('tr', { class: 'row' }, [
+        h('td', { text: v.effectiveFrom }),
+        h('td', {}, [h('span', { class: 'tag tag-ok', text: v.id }), v.boundary ? h('span', { class: 'tag tag-warn', text: '新年开户' }) : null]),
+        h('td', { class: 'mono', text: fmt(v.codTons, 4) }),
+        h('td', { class: 'mono', text: fmt(v.ammoniaTons, 4) }),
+        h('td', { text: v.documentRef }),
+        h('td', { text: v.registeredBy }),
+        h('td', { class: 'nowrap', text: v.registeredAt }),
+        h('td', { class: 'nowrap' }, [
+          h('div', { class: 'sub', text: 'COD：' + v.carryLabels.COD }),
+          h('div', { class: 'sub', text: '氨氮：' + v.carryLabels['氨氮'] })
+        ]),
+        h('td', { class: 'nowrap' }, acts)
+      ]));
+    });
+    return h('div', { class: 'table-wrap' }, h('table', { class: 'mini-table' }, [
+      h('thead', {}, h('tr', {}, [
+        h('th', { text: '生效日' }), h('th', { text: '版本' }),
+        h('th', { text: 'COD 年许可(吨)' }), h('th', { text: '氨氮年许可(吨)' }),
+        h('th', { text: '依据文件' }), h('th', { text: '登记人' }), h('th', { text: '登记时刻' }),
+        h('th', { text: '上年余额结转' }), h('th', { text: '操作' })
+      ])),
+      tb
+    ]));
+  }
+
+  function segComposeText(metric) {
+    return (metric.segments || []).map(function (p) {
+      return (p.synthetic ? '默认' : p.versionId) + ' ' + p.days + '天';
+    }).join(' · ') || '—';
+  }
+
+  function ledgerMonthDetail(month) {
+    var box = h('div');
+    MAIN_METRICS.forEach(function (metric) {
+      var m = month.metrics[metric];
+      box.appendChild(h('h3', { text: metric + ' 分段核算（许可年 ' + month.permitYear + '，上年带入 ' + fmt(m.carryIn, 4) + ' 吨）' }));
+      var tb = h('tbody');
+      m.segments.forEach(function (p) {
+        tb.appendChild(h('tr', {}, [
+          h('td', {}, versionTag(p)),
+          h('td', { class: 'nowrap', text: p.start + ' ~ ' + storeDayBefore(p.end) }),
+          h('td', { class: 'mono', text: String(p.days) }),
+          h('td', { class: 'mono', text: fmt(p.annualTons, 4) }),
+          h('td', { class: 'mono', text: fmt(p.permitShare, 4) }),
+          h('td', { class: 'mono', text: fmt(p.usedShare, 4) }),
+          h('td', { class: 'mono ' + (p.segmentRemaining < 0 ? 'num-danger' : ''), text: fmt(p.segmentRemaining, 4) }),
+          h('td', { class: 'nowrap sub', text: p.documentRef || '' })
+        ]));
+      });
+      box.appendChild(h('div', { class: 'table-wrap' }, h('table', { class: 'mini-table' }, [
+        h('thead', {}, h('tr', {}, [
+          h('th', { text: '适用版本' }), h('th', { text: '时段' }), h('th', { text: '天数' }),
+          h('th', { text: '年许可(吨)' }), h('th', { text: '天数折算许可(吨)' }),
+          h('th', { text: '实测已用(吨)' }), h('th', { text: '段内剩余(吨)' }), h('th', { text: '依据' })
+        ])),
+        tb
+      ])));
+    });
+    if (month.frozen && month.frozen.length) {
+      box.appendChild(h('div', { class: 'section-note' }, month.frozen.map(function (f) {
+        return h('span', { class: 'tag tag-frozen' }, f.reportId + ' 第' + f.seq + '次冻结 ' + (f.savedBy || '') + ' ' + f.savedAt);
+      })));
+    }
+    return box;
+  }
+
+  function storeDayBefore(dayText) {
+    var d = dayText.split('-').map(Number);
+    var dt = new Date(Date.UTC(d[0], d[1] - 1, d[2] - 1));
+    var p = function (n) { return String(n).padStart(2, '0'); };
+    return dt.getUTCFullYear() + '-' + p(dt.getUTCMonth() + 1) + '-' + p(dt.getUTCDate());
+  }
+
+  function permitLedger(plant) {
+    var holder = h('div', { class: 'empty', text: '台账加载中…' });
+    api('GET', '/api/plants/' + plant.id + '/ledger').then(function (res) {
+      clear(holder);
+      if (!res.months.length) { holder.appendChild(h('div', { class: 'empty', text: '还没有可核算的月份' })); return; }
+      var tb = h('tbody');
+      res.months.forEach(function (month) {
+        var cod = month.metrics.COD, nh = month.metrics['氨氮'];
+        var frozenBadges = (month.frozen || []).map(function (f) {
+          return h('span', { class: 'tag tag-frozen', text: f.reportId + ' #' + f.seq });
+        });
+        tb.appendChild(expandableRow([
+          h('td', { text: month.month }),
+          h('td', { class: 'nowrap sub', text: segComposeText(cod) }),
+          h('td', { class: 'mono', text: fmt(cod.monthPermit, 4) }),
+          h('td', { class: 'mono', text: fmt(cod.monthUsed, 4) }),
+          h('td', { class: 'mono', text: fmt(nh.monthPermit, 4) }),
+          h('td', { class: 'mono', text: fmt(nh.monthUsed, 4) }),
+          h('td', { class: 'mono', text: fmt(cod.ytdPermit, 4) }),
+          h('td', { class: 'mono', text: fmt(cod.ytdUsed, 4) }),
+          h('td', { class: 'mono ' + (cod.remaining < 0 ? 'num-danger' : 'num-ok'), text: fmt(cod.remaining, 4) }),
+          h('td', { class: 'nowrap' }, frozenBadges.length ? frozenBadges : h('span', { class: 'sub', text: '未冻结' }))
+        ], function () { return ledgerMonthDetail(month); }));
+      });
+      holder.appendChild(h('div', { class: 'table-wrap' }, h('table', { class: 'mini-table' }, [
+        h('thead', {}, h('tr', {}, [
+          h('th', { text: '期间' }), h('th', { text: '时段构成' }),
+          h('th', { text: 'COD月许可' }), h('th', { text: 'COD月已用' }),
+          h('th', { text: '氨氮月许可' }), h('th', { text: '氨氮月已用' }),
+          h('th', { text: 'COD累计许可' }), h('th', { text: 'COD累计已用' }), h('th', { text: 'COD剩余(吨)' }),
+          h('th', { text: '冻结' })
+        ])),
+        tb
+      ])));
+    }).catch(function (e) { clear(holder).appendChild(h('div', { class: 'empty', text: '台账加载失败：' + e.message })); });
+    return holder;
+  }
+
+  function carryoverBox(plant, versions) {
+    var box = h('div', { class: 'carry-box full' });
+    var hint = h('div', { class: 'section-note', text: '' });
+    var rows = h('div');
+    var inputs = {};
+    MAIN_METRICS.forEach(function (metric) {
+      var key = metric === 'COD' ? 'Cod' : 'Amm';
+      var modeSel = sel(CARRY_MODES, 'none', null);
+      modeSel.dataset.field = 'carry' + key + 'Mode';
+      var fixedInput = h('input', { type: 'number', min: '0', step: '0.0001', dataset: { field: 'carry' + key + 'Fixed' } });
+      fixedInput.placeholder = '结余量（吨）';
+      fixedInput.hidden = true;
+      modeSel.addEventListener('change', function () { fixedInput.hidden = modeSel.value !== 'fixed'; });
+      rows.appendChild(h('div', { class: 'carry-row' }, [h('label', { text: metric + ' 上年余额' }), modeSel, fixedInput]));
+      inputs[metric] = { mode: modeSel, fixed: fixedInput };
+    });
+    box.appendChild(hint);
+    box.appendChild(rows);
+    box.update = function (dateVal) {
+      var boundary = isBoundaryDay(plant, versions, dateVal);
+      box.dataset.boundary = boundary ? '1' : '0';
+      rows.hidden = !boundary;
+      hint.textContent = boundary
+        ? '该生效日开启新的许可年：请逐指标登记上年余额能否带入、带多少（上年亏空不结转）。'
+        : '本次变更不跨许可年：已用量与剩余量按同一口径在年内衔接，不涉及跨年结转。';
+    };
+    return box;
+  }
+
+  function openPermitVersionForm(plant, version) {
+    var versions = versionsOfPlant(plant.id);
+    var fields = [
+      { name: 'effectiveFrom', label: '变更生效日', type: 'date' },
+      { name: 'codTons', label: '变更后 COD 年许可（吨）', type: 'number' },
+      { name: 'ammoniaTons', label: '变更后氨氮年许可（吨）', type: 'number' },
+      { name: 'documentRef', label: '依据文件（批复/变更文件名或文号）' },
+      { name: 'registeredBy', label: '登记人' },
+      { name: 'remark', label: '备注', full: true }
+    ];
+    var values = version ? {
+      effectiveFrom: version.effectiveFrom, codTons: version.codTons, ammoniaTons: version.ammoniaTons,
+      documentRef: version.documentRef, registeredBy: version.registeredBy, remark: version.remark || ''
+    } : { effectiveFrom: state.today || '', codTons: '', ammoniaTons: '', documentRef: '', registeredBy: '' };
+    var form = buildForm(fields, values);
+    var carryBox = null;
+    if (!version) {
+      carryBox = carryoverBox(plant, versions);
+      form.appendChild(carryBox);
+      var dateInput = form.querySelector('[data-field="effectiveFrom"]');
+      dateInput.addEventListener('change', function () { carryBox.update(dateInput.value); });
+      carryBox.update(values.effectiveFrom);
+    } else {
+      form.appendChild(h('div', { class: 'section-note full', text: '生效日 ' + version.effectiveFrom + ' 不可修改；被已上报月报引用的版本不能再改数值。' }));
+    }
+    var save = h('button', { type: 'button', class: 'btn btn-accent', text: version ? '保存修改' : '登记变更' });
+    save.addEventListener('click', function () {
+      var raw = collectForm(form);
+      var payload = {
+        codTons: Number(raw.codTons),
+        ammoniaTons: Number(raw.ammoniaTons),
+        documentRef: raw.documentRef,
+        registeredBy: raw.registeredBy,
+        remark: raw.remark
+      };
+      if (!version) {
+        payload.effectiveFrom = raw.effectiveFrom;
+        payload.carryover = {};
+        if (carryBox.dataset.boundary === '1') {
+          MAIN_METRICS.forEach(function (metric) {
+            var key = metric === 'COD' ? 'Cod' : 'Amm';
+            var mode = raw['carry' + key + 'Mode'] || 'none';
+            payload.carryover[metric] = { mode: mode, amount: mode === 'fixed' ? Number(raw['carry' + key + 'Fixed']) : 0 };
+          });
+        } else {
+          payload.carryover = { COD: { mode: 'none', amount: 0 }, '氨氮': { mode: 'none', amount: 0 } };
+        }
+      }
+      var req = version
+        ? api('PATCH', '/api/permit-versions/' + version.id, payload)
+        : api('POST', '/api/permit-versions', Object.assign({ plantId: plant.id }, payload));
+      req.then(function () { closeModal(); return afterMutation(version ? '变更登记已修改' : '变更已登记，许可量已分段'); }).catch(showError);
+    });
+    openModal(version ? '修改变更登记' : '登记排污许可变更（' + plant.name + '）', form, [
+      h('button', { type: 'button', class: 'btn btn-ghost', text: '取消', onclick: closeModal }), save
+    ]);
+  }
+
+  async function renderPermits() {
+    var f = clear(document.getElementById('filters-permits'));
+    f.appendChild(h('div', { class: 'filter-box' }, [
+      h('div', { class: 'filter-title', text: '排污单位' }),
+      h('div', { class: 'field' }, [h('label', { text: '单位' }),
+        sel([{ value: '', label: '全部' }].concat(state.plants.map(function (p) { return { value: p.id, label: p.code + ' ' + p.name }; })),
+          state.permitsFilter.plantId, function (v) { state.permitsFilter.plantId = v; renderPermits(); })])
+    ]));
+    f.appendChild(h('div', { class: 'filter-box' }, [
+      h('div', { class: 'filter-title', text: '分段口径' }),
+      h('div', { class: 'sub' }, '变更生效日起按新许可量核算；变更当月按日折算分段。已上报月份冻结当时快照，不被新许可改写。')
+    ]));
+
+    var c = clear(document.getElementById('content-permits'));
+    var plants = state.permitsFilter.plantId ? state.plants.filter(function (p) { return p.id === state.permitsFilter.plantId; }) : state.plants;
+    if (!plants.length) { c.appendChild(h('div', { class: 'empty', text: '还没有排污单位' })); return; }
+    plants.forEach(function (plant) {
+      var versions = versionsOfPlant(plant.id);
+      var card = h('div', { class: 'card' });
+      card.appendChild(h('div', { class: 'card-head' }, [
+        h('h2', { text: plant.code + ' ' + plant.name + '（' + plant.permitNo + '）' }),
+        h('div', { class: 'btn-row' }, [
+          h('span', { class: 'sub', text: '许可年起始日 ' + plant.permitYearStart + ' · 已登记 ' + versions.length + ' 次变更' }),
+          h('button', { type: 'button', class: 'btn btn-sm btn-accent', text: '登记变更', onclick: function () { openPermitVersionForm(plant, null); } })
+        ])
+      ]));
+      var body = h('div', { class: 'card-body' });
+      body.appendChild(h('h3', { text: '许可分段时间线' }));
+      body.appendChild(permitTimeline(plant));
+      body.appendChild(h('h3', { text: '许可年逐月台账（点月份展开逐段折算明细）' }));
+      body.appendChild(permitLedger(plant));
+      card.appendChild(body);
+      c.appendChild(card);
+    });
+  }
+
   /* ================= 设置 ================= */
   function openSettings() {
     var s = state.settings || {};
@@ -1181,8 +1581,8 @@
       { name: 'codDailyLimit', label: 'COD 日限值', type: 'number' },
       { name: 'ammoniaDailyLimit', label: '氨氮日限值', type: 'number' },
       { name: 'hourlyExceedCountLimit', label: '小时超标次数', type: 'number' },
-      { name: 'annualPermitCodTons', label: '年许可 COD（吨）', type: 'number' },
-      { name: 'annualPermitAmmoniaTons', label: '年许可氨氮（吨）', type: 'number' }
+      { name: 'annualPermitCodTons', label: '年许可 COD（吨，系统默认：未登记变更的单位）', type: 'number' },
+      { name: 'annualPermitAmmoniaTons', label: '年许可氨氮（吨，系统默认：未登记变更的单位）', type: 'number' }
     ];
     var form = buildForm(fields, s);
     var save = h('button', { type: 'button', class: 'btn btn-accent', text: '保存设置' });

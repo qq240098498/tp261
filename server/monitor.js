@@ -1,5 +1,6 @@
 // 监测数据口径都集中在这里：有效读数、折算、日均、总量、超标、许可
 const store = require('./store');
+const { AppError } = require('./errors');
 
 function plantOf(data, id) {
   return data.plants.find((p) => p.id === id) || null;
@@ -122,15 +123,271 @@ function monthAverage(data, outletId, metric, month) {
 
 // 月总量（吨）：逐小时浓度乘以流量相加
 function monthTotal(data, outletId, metric, month) {
+  const mStart = month + '-01 00:00:00';
+  const mEnd = store.addDaysText(month + '-01', store.daysInMonth(month)) + ' 00:00:00';
+  return rangeTotal(data, outletId, metric, mStart, mEnd);
+}
+
+// 区间总量（吨）：[fromAt, toAt) 半开区间，按同一时刻配对流量，支持变更分段按日切分
+function rangeTotal(data, outletId, metric, fromAt, toAt) {
   const settings = data.settings;
-  const concRows = readingsOf(data, { outletId, metric, month }).filter((r) => isCounted(r, deviceOf(data, r.deviceId), settings));
-  const flowRows = readingsOf(data, { outletId, metric: '流量', month }).filter((r) => isCounted(r, deviceOf(data, r.deviceId), settings));
+  const rows = readingsOf(data, { outletId, metric }).filter((r) => {
+    if (!isCounted(r, deviceOf(data, r.deviceId), settings)) return false;
+    return (!fromAt || r.at >= fromAt) && (!toAt || r.at < toAt);
+  });
   let mg = 0;
-  for (let i = 0; i < concRows.length; i += 1) {
-    const flow = flowRows[i] ? Number(flowRows[i].value) : 0;
-    mg += effectiveConcentration(concRows[i], settings) * flow;
-  }
+  for (const row of rows) mg += effectiveConcentration(row, settings) * flowAt(data, row);
   return store.round(mg / Number(settings.tonsDivisor), 4);
+}
+
+// 排污单位区间总量：名下排放口相加
+function rangePlantTotal(data, plantId, metric, fromAt, toAt) {
+  let total = 0;
+  for (const o of outletsOf(data, plantId)) total += rangeTotal(data, o.id, metric, fromAt, toAt);
+  return store.round(total, 4);
+}
+
+// ---------- 许可分段 ----------
+
+const PERMIT_METRICS = ['COD', '氨氮'];
+
+function annualField(metric) {
+  return metric === '氨氮' ? 'ammoniaTons' : 'codTons';
+}
+
+// 某一时段适用的许可年许可量（合成段取全局设置兜底）
+function versionAnnual(seg, metric, settings) {
+  if (seg && seg.synthetic) return Number(metric === '氨氮' ? settings.annualPermitAmmoniaTons : settings.annualPermitCodTons);
+  return Number(seg ? seg[annualField(metric)] : 0);
+}
+
+function plantVersions(data, plantId) {
+  return (data.permitVersions || []).filter((v) => v.plantId === plantId)
+    .slice().sort((a, b) => (a.effectiveFrom < b.effectiveFrom ? -1 : 1));
+}
+
+// 没有登记过任何分段时，用全局年许可量 + 许可年起始日合成一段，保证老数据老页面照常
+function syntheticVersion(data, plant) {
+  return {
+    id: 'synthetic',
+    plantId: plant.id,
+    effectiveFrom: String(plant.permitYearStart || data.settings.permitYearStart),
+    codTons: Number(data.settings.annualPermitCodTons),
+    ammoniaTons: Number(data.settings.annualPermitAmmoniaTons),
+    documentRef: '系统默认许可量（全局设置）',
+    registeredBy: '',
+    registeredAt: '',
+    synthetic: true,
+  };
+}
+
+// 某日适用的许可版本：生效日不晚于该日的最近一次登记；生效日当天归新版
+function versionAtDay(data, plant, day) {
+  const vs = plantVersions(data, plant.id);
+  let cur = null;
+  for (const v of vs) {
+    if (v.effectiveFrom <= day) cur = v;
+  }
+  return cur || syntheticVersion(data, plant);
+}
+
+// 许可年（可跨历年，如 2025-07-01 起的许可年到 2026-06-30）
+function permitYearBase(plant) {
+  const s = String(plant.permitYearStart || '2026-01-01');
+  return { y: Number(s.slice(0, 4)), m: Number(s.slice(5, 7)), d: Number(s.slice(8, 10)) };
+}
+
+function permitYearStartDay(plant, index) {
+  const base = permitYearBase(plant);
+  const y = base.y + index;
+  const p = (n) => String(n).padStart(2, '0');
+  return y + '-' + p(base.m) + '-' + p(base.d);
+}
+
+// 某日落在第几个许可年（起始日当天算新的一年）
+function permitYearIndex(plant, day) {
+  const base = permitYearBase(plant);
+  const y = Number(day.slice(0, 4));
+  const m = Number(day.slice(5, 7));
+  const d = Number(day.slice(8, 10));
+  let idx = y - base.y;
+  if (m < base.m || (m === base.m && d < base.d)) idx -= 1;
+  return idx;
+}
+
+function permitYearRange(plant, index) {
+  const start = permitYearStartDay(plant, index);
+  return { start, end: permitYearStartDay(plant, index + 1), days: store.diffDays(permitYearStartDay(plant, index + 1), start) };
+}
+
+// 一个许可年内的分段切分：[start,end) 半开，含从上一年延续过来的版本/合成段
+function yearSegments(data, plant, index) {
+  const range = permitYearRange(plant, index);
+  const breaks = [range.start];
+  for (const v of plantVersions(data, plant.id)) {
+    if (v.effectiveFrom > range.start && v.effectiveFrom < range.end) breaks.push(v.effectiveFrom);
+  }
+  breaks.push(range.end);
+  const out = [];
+  for (let i = 0; i < breaks.length - 1; i += 1) {
+    const start = breaks[i];
+    const end = breaks[i + 1];
+    out.push({ version: versionAtDay(data, plant, start), start, end, days: store.diffDays(end, start) });
+  }
+  return out;
+}
+
+// [start,end) 区间按历年分组天数（非 1 月 1 日起始的许可年会跨两个历年，闰年按 366）
+function daysByCalendarYear(start, end) {
+  const groups = [];
+  let cur = start;
+  while (cur < end) {
+    const y = Number(cur.slice(0, 4));
+    const yearEnd = (y + 1) + '-01-01';
+    const segEnd = yearEnd < end ? yearEnd : end;
+    groups.push({ year: y, days: store.diffDays(segEnd, cur) });
+    cur = segEnd;
+  }
+  return groups;
+}
+
+// 按日折算许可量：年许可 × 各历年天数 / 各历年天数长度
+function dayWeighted(annual, start, end) {
+  let v = 0;
+  for (const g of daysByCalendarYear(start, end)) v += Number(annual) * g.days / store.daysInYear(g.year);
+  return store.round(v, 4);
+}
+
+// 打开某许可年的第一次登记（跨年变更的结转政策登记在这条版本上）
+function yearOpener(data, plant, index) {
+  const range = permitYearRange(plant, index);
+  return plantVersions(data, plant.id).find((v) => v.effectiveFrom >= range.start && v.effectiveFrom < range.end) || null;
+}
+
+// 某许可年结束时的余额：全年按日折算许可 + 上年带入 − 全年实测；亏空为负
+function yearEndRemaining(data, plant, index, metric) {
+  const range = permitYearRange(plant, index);
+  let allowance = carryInto(data, plant, index, metric);
+  for (const seg of yearSegments(data, plant, index)) {
+    allowance += dayWeighted(versionAnnual(seg.version, metric, data.settings), seg.start, seg.end);
+  }
+  const used = rangePlantTotal(data, plant.id, metric, range.start + ' 00:00:00', range.end + ' 00:00:00');
+  return store.round(allowance - used, 4);
+}
+
+// 上年余额带入：none=0 / full=上年末余额（亏空不带入，钳到 0）/ fixed=登记吨数
+// 开户段（含首个许可年的首次登记）显式登记结转政策时，上一许可年按合成段计算余额
+function carryInto(data, plant, index, metric) {
+  const opener = yearOpener(data, plant, index);
+  if (!opener || !opener.carryover) return 0;
+  const c = opener.carryover[metric] || {};
+  if (c.mode === 'fixed') {
+    const amount = Number(c.amount);
+    return Number.isFinite(amount) && amount > 0 ? store.round(amount, 4) : 0;
+  }
+  if (c.mode === 'full') return store.round(Math.max(0, yearEndRemaining(data, plant, index - 1, metric)), 4);
+  return 0;
+}
+
+// 排污单位某月的分段核算：每段按日折算许可 + 实测归集 + 年累计与剩余（同口径衔接）
+function plantMonthAccounting(data, plantId, month) {
+  const plant = plantOf(data, plantId);
+  if (!plant) throw new AppError(404, 'PLANT_NOT_FOUND', '这个排污单位不存在');
+  const mStart = month + '-01';
+  const mEnd = store.addDaysText(mStart, store.daysInMonth(month));
+  const index = permitYearIndex(plant, mStart);
+  const range = permitYearRange(plant, index);
+  const metrics = {};
+  for (const metric of PERMIT_METRICS) {
+    const carryIn = carryInto(data, plant, index, metric);
+    const pieces = [];
+    for (const seg of yearSegments(data, plant, index)) {
+      if (seg.end <= mStart || seg.start >= mEnd) continue;
+      const start = seg.start > mStart ? seg.start : mStart;
+      const end = seg.end < mEnd ? seg.end : mEnd;
+      const days = store.diffDays(end, start);
+      const permitShare = dayWeighted(versionAnnual(seg.version, metric, data.settings), start, end);
+      const usedShare = rangePlantTotal(data, plantId, metric, start + ' 00:00:00', end + ' 00:00:00');
+      pieces.push({
+        versionId: seg.version.id,
+        effectiveFrom: seg.version.effectiveFrom,
+        documentRef: seg.version.documentRef || '',
+        registeredBy: seg.version.registeredBy || '',
+        synthetic: !!seg.version.synthetic,
+        start, end, days,
+        daysByYear: daysByCalendarYear(start, end),
+        annualTons: versionAnnual(seg.version, metric, data.settings),
+        permitShare,
+        usedShare,
+        segmentRemaining: store.round(permitShare - usedShare, 4),
+      });
+    }
+    const monthPermit = store.round(pieces.reduce((a, p) => a + p.permitShare, 0), 4);
+    const monthUsed = store.round(pieces.reduce((a, p) => a + p.usedShare, 0), 4);
+    // 年累计许可：截至月末各段按日折算（按历年天数）+ 全年可用的上年结转
+    let ytdAllowanceBase = carryIn;
+    for (const seg of yearSegments(data, plant, index)) {
+      if (seg.start >= mEnd) continue;
+      const segEnd = seg.end < mEnd ? seg.end : mEnd;
+      ytdAllowanceBase += dayWeighted(versionAnnual(seg.version, metric, data.settings), seg.start, segEnd);
+    }
+    const ytdPermit = store.round(ytdAllowanceBase, 4);
+    const ytdUsed = rangePlantTotal(data, plantId, metric, range.start + ' 00:00:00', mEnd + ' 00:00:00');
+    const remaining = store.round(ytdPermit - ytdUsed, 4);
+    metrics[metric] = {
+      monthPermit, monthUsed, carryIn,
+      ytdPermit, ytdUsed, remaining, overdrawn: remaining < 0,
+      segments: pieces,
+    };
+  }
+  return {
+    plantId, plantName: plant.name, month,
+    permitYear: permitYearBase(plant).y + index,
+    permitYearStart: range.start,
+    permitYearDays: range.days,
+    metrics,
+  };
+}
+
+// 已上报快照：冻结当时各排放口总量、适用许可版本、分段折算、年累计与结论
+function buildReportSnapshot(data, report, savedBy) {
+  const plant = plantOf(data, report.plantId);
+  const month = String(report.period).slice(0, 7);
+  const acc = plantMonthAccounting(data, plant.id, month);
+  const outlets = outletsOf(data, plant.id).map((o) => {
+    const s = outletSummary(data, o.id, month);
+    return { id: o.id, code: o.code, name: o.name, rows: s.rows };
+  });
+  const totals = {};
+  const conclusion = {};
+  const versionIds = [];
+  for (const metric of PERMIT_METRICS) {
+    const m = acc.metrics[metric];
+    totals[metric] = {
+      monthUsed: m.monthUsed, monthPermit: m.monthPermit, carryIn: m.carryIn,
+      ytdUsed: m.ytdUsed, ytdPermit: m.ytdPermit, remaining: m.remaining, overdrawn: m.overdrawn,
+    };
+    for (const seg of m.segments) {
+      if (!seg.synthetic && !versionIds.includes(seg.versionId)) versionIds.push(seg.versionId);
+    }
+    conclusion[metric] = {
+      tonnageOver: m.overdrawn,
+      concentrationOutletCount: outlets.filter((o) => (o.rows.find((r) => r.metric === metric) || {}).exceeded).length,
+    };
+  }
+  const seq = Array.isArray(report.snapshots) ? report.snapshots.length + 1 : 1;
+  return {
+    seq,
+    savedAt: store.nowText(),
+    savedBy: String(savedBy || ''),
+    month,
+    permitYear: acc.permitYear,
+    outlets,
+    metrics: acc.metrics,
+    totals,
+    versionIds,
+    conclusion,
+  };
 }
 
 // 季度总量：按当季日均乘以季节天数
@@ -228,6 +485,11 @@ function outletSummary(data, outletId, month) {
 module.exports = {
   plantOf, outletOf, deviceOf,
   readingsOf, isCounted, effectiveConcentration, oxygenAt, flowAt,
-  dayRows, dailyStats, dailySeries, monthAverage, monthTotal, quarterTotal, quarterPermitTons, accumulatedTons,
+  dayRows, dailyStats, dailySeries, monthAverage, monthTotal, rangeTotal, rangePlantTotal,
+  quarterTotal, quarterPermitTons, accumulatedTons,
+  PERMIT_METRICS, plantVersions, syntheticVersion, versionAtDay,
+  permitYearStartDay, permitYearIndex, permitYearRange, yearSegments,
+  daysByCalendarYear, dayWeighted,
+  yearEndRemaining, carryInto, plantMonthAccounting, buildReportSnapshot,
   exceedance, outletsOf, outletSummary,
 };

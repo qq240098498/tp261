@@ -126,8 +126,21 @@ router.delete('/readings/:id', withData((data, req) => ({ __save: true, __body: 
 
 router.get('/reports', withData((data, req) => res.listReports(data, req.query)));
 router.post('/reports', withData((data, req) => ({ __save: true, __body: res.createReport(data, req.body || {}) })));
-router.get('/reports/:id', withData((data, req) => res.reportDetail(data, req.params.id)));
+router.get('/reports/:id', withData((data, req) => res.reportDetail(data, req.params.id, req.query)));
 router.patch('/reports/:id', withData((data, req) => ({ __save: true, __body: res.updateReport(data, req.params.id, req.body || {}) })));
+router.get('/reports/:id/snapshots', withData((data, req) => {
+  const report = data.reports.find((x) => x.id === req.params.id);
+  if (!report) throw new AppError(404, 'REPORT_NOT_FOUND', '这张报表不存在');
+  return { reportId: report.id, period: report.period, snapshots: report.snapshots || [] };
+}));
+
+// 排污许可分段（变更登记）与许可年台账
+router.get('/permit-versions', withData((data, req) => res.listPermitVersions(data, req.query)));
+router.post('/permit-versions', withData((data, req) => ({ __save: true, __body: res.createPermitVersion(data, req.body || {}) })));
+router.patch('/permit-versions/:id', withData((data, req) => ({ __save: true, __body: res.updatePermitVersion(data, req.params.id, req.body || {}) })));
+router.delete('/permit-versions/:id', withData((data, req) => ({ __save: true, __body: res.removePermitVersion(data, req.params.id) })));
+router.get('/plants/:id/permit', withData((data, req) => res.permitDetail(data, req.params.id)));
+router.get('/plants/:id/ledger', withData((data, req) => res.plantLedger(data, req.params.id, req.query)));
 
 router.use((req, r, next) => next(new AppError(404, 'NOT_FOUND', '这个地址没有对应功能：' + req.method + ' ' + req.originalUrl)));
 
